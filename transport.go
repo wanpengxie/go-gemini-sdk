@@ -223,6 +223,18 @@ func buildCLIArgs(o options) []string {
 	if o.sandbox != "" {
 		args = append(args, "--sandbox", o.sandbox)
 	}
+	if o.approvalMode != "" {
+		args = append(args, "--approval-mode", o.approvalMode)
+	}
+	if len(o.allowedTools) > 0 {
+		args = append(args, "--allowed-tools", strings.Join(o.allowedTools, ","))
+	}
+	if len(o.excludedTools) > 0 {
+		args = append(args, "--excluded-tools", strings.Join(o.excludedTools, ","))
+	}
+	if len(o.addDirs) > 0 {
+		args = append(args, "--include-directories", strings.Join(o.addDirs, ","))
+	}
 	return args
 }
 

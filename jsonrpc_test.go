@@ -88,7 +88,7 @@ func TestConnRequestHandler(t *testing.T) {
 	defer rpcConn.close()
 
 	rpcConn.registerHandler(methodRequestPermission, func(ctx context.Context, raw json.RawMessage) (any, error) {
-		return requestPermissionResult{Allow: true, Reason: "ok"}, nil
+		return requestPermissionResult{SelectedOptionID: "allow_once"}, nil
 	})
 
 	dec := json.NewDecoder(serverSide)
@@ -118,8 +118,8 @@ func TestConnRequestHandler(t *testing.T) {
 	if err := json.Unmarshal(resp.Result, &result); err != nil {
 		t.Fatalf("unmarshal result: %v", err)
 	}
-	if !result.Allow {
-		t.Fatalf("result allow = false, want true")
+	if result.SelectedOptionID != "allow_once" {
+		t.Fatalf("selected_option_id = %q, want %q", result.SelectedOptionID, "allow_once")
 	}
 }
 

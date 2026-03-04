@@ -25,6 +25,31 @@ func TestBuildCLIArgsIncludesModelAndSandbox(t *testing.T) {
 	}
 }
 
+func TestBuildCLIArgsIncludesPolicyFlags(t *testing.T) {
+	o := defaultOptions()
+	o.approvalMode = "auto"
+	o.allowedTools = []string{"bash", "read"}
+	o.excludedTools = []string{"edit"}
+	o.addDirs = []string{"/repo", "/tmp"}
+
+	args := buildCLIArgs(o)
+	want := []string{
+		"--experimental-acp",
+		"--approval-mode", "auto",
+		"--allowed-tools", "bash,read",
+		"--excluded-tools", "edit",
+		"--include-directories", "/repo,/tmp",
+	}
+	if len(args) != len(want) {
+		t.Fatalf("args len = %d, want %d (%v)", len(args), len(want), args)
+	}
+	for i := range want {
+		if args[i] != want[i] {
+			t.Fatalf("args[%d] = %q, want %q", i, args[i], want[i])
+		}
+	}
+}
+
 func TestStderrRingKeepsTail(t *testing.T) {
 	ring := newStderrRing(8)
 	ring.Append([]byte("12345"))

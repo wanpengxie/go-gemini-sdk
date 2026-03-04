@@ -90,6 +90,7 @@ func (c *Client) Connect(ctx context.Context) error {
 	stream := &stdioStream{reader: handle.Stdout, writer: handle.Stdin}
 	rpcConn := newConn(stream, c.opts.maxEventBytes)
 	rpcConn.registerHandler(methodRequestPermission, c.handlePermissionRequest)
+	rpcConn.registerHandler(methodSessionRequestPermission, c.handlePermissionRequest)
 
 	if err := c.callInitialize(startupCtx, rpcConn); err != nil {
 		c.cleanupFailedConnect(handle, rpcConn, stderrDone)
@@ -333,26 +334,119 @@ func (c *Client) handlePermissionRequest(ctx context.Context, raw json.RawMessag
 		}
 	}
 
-	req := PermissionRequest{
+	toolCall := normalizeToolCallInfo(params)
+	options := params.Options
+
+	selectedOptionID := ""
+	if c.opts.canUseTool != nil {
+		cbCtx, cancel := withTimeoutIfNeeded(ctx, c.opts.requestTimeout)
+		defer cancel()
+
+		var err error
+		selectedOptionID, err = c.opts.canUseTool(cbCtx, toolCall, options)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if strings.TrimSpace(selectedOptionID) == "" {
+		selectedOptionID = pickSafeFallbackOption(options)
+	}
+	if selectedOptionID == "" {
+		return nil, &ProtocolError{Method: methodRequestPermission, Message: "missing permission options"}
+	}
+	if !hasPermissionOption(options, selectedOptionID) {
+		return nil, &ProtocolError{Method: methodRequestPermission, Message: "selected option id not found"}
+	}
+
+	return requestPermissionResult{
+		SelectedOptionID: selectedOptionID,
+		OptionID:         selectedOptionID,
+	}, nil
+}
+
+func normalizeToolCallInfo(params requestPermissionParams) ToolCallInfo {
+	call := ToolCallInfo{
 		SessionID: params.SessionID,
-		ToolName:  params.ToolName,
+		ToolName:  strings.TrimSpace(params.ToolName),
+		ToolKind:  normalizeToolKind(params.ToolKind, params.ToolName),
 		Reason:    params.Reason,
 		Args:      params.Args,
 	}
-
-	if c.opts.canUseTool == nil {
-		return requestPermissionResult{Allow: true, Reason: "no callback configured"}, nil
+	if params.ToolCall == nil {
+		return call
 	}
-
-	cbCtx, cancel := withTimeoutIfNeeded(ctx, c.opts.requestTimeout)
-	defer cancel()
-
-	res, err := c.opts.canUseTool(cbCtx, req)
-	if err != nil {
-		return nil, err
+	if call.ToolName == "" {
+		call.ToolName = strings.TrimSpace(params.ToolCall.Name)
 	}
+	if call.ToolKind == ToolKindUnknown {
+		call.ToolKind = normalizeToolKind(params.ToolCall.Kind, params.ToolCall.Name)
+	}
+	if len(call.Args) == 0 && len(params.ToolCall.Args) > 0 {
+		call.Args = params.ToolCall.Args
+	}
+	return call
+}
 
-	return requestPermissionResult{Allow: res.Allow, Reason: res.Reason}, nil
+func normalizeToolKind(kind ToolKind, toolName string) ToolKind {
+	if k := strings.ToLower(strings.TrimSpace(string(kind))); k != "" {
+		return ToolKind(k)
+	}
+	switch strings.ToLower(strings.TrimSpace(toolName)) {
+	case string(ToolKindRead):
+		return ToolKindRead
+	case string(ToolKindEdit):
+		return ToolKindEdit
+	case string(ToolKindBash), "shell":
+		return ToolKindBash
+	default:
+		return ToolKindUnknown
+	}
+}
+
+func pickSafeFallbackOption(options []PermissionOption) string {
+	if id := findOptionByPrefix(options, "reject_"); id != "" {
+		return id
+	}
+	if id := findOptionByPrefix(options, "allow_"); id != "" {
+		return id
+	}
+	for _, option := range options {
+		if id := strings.TrimSpace(option.ID); id != "" {
+			return id
+		}
+	}
+	return ""
+}
+
+func findOptionByPrefix(options []PermissionOption, prefix string) string {
+	prefix = strings.ToLower(strings.TrimSpace(prefix))
+	if prefix == "" {
+		return ""
+	}
+	for _, option := range options {
+		id := strings.TrimSpace(option.ID)
+		if id == "" {
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(id), prefix) {
+			return id
+		}
+	}
+	return ""
+}
+
+func hasPermissionOption(options []PermissionOption, selectedOptionID string) bool {
+	selectedOptionID = strings.TrimSpace(selectedOptionID)
+	if selectedOptionID == "" {
+		return false
+	}
+	for _, option := range options {
+		if strings.TrimSpace(option.ID) == selectedOptionID {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Client) pumpNotifications(rpcConn *conn) {

@@ -32,19 +32,32 @@ type SessionEvent struct {
 	Data       json.RawMessage `json:"data,omitempty"`
 }
 
-// PermissionRequest describes an incoming request_permission call.
-type PermissionRequest struct {
+// ToolKind represents the normalized tool category.
+type ToolKind string
+
+const (
+	ToolKindUnknown ToolKind = "unknown"
+	ToolKindRead    ToolKind = "read"
+	ToolKindEdit    ToolKind = "edit"
+	ToolKindBash    ToolKind = "bash"
+)
+
+// PermissionOption represents one selectable option in request_permission.
+type PermissionOption struct {
+	ID          string `json:"id"`
+	Name        string `json:"name,omitempty"`
+	Kind        string `json:"kind,omitempty"`
+	Description string `json:"description,omitempty"`
+}
+
+// ToolCallInfo describes the incoming tool invocation request.
+type ToolCallInfo struct {
 	SessionID string          `json:"session_id,omitempty"`
 	ToolName  string          `json:"tool_name,omitempty"`
+	ToolKind  ToolKind        `json:"tool_kind,omitempty"`
 	Reason    string          `json:"reason,omitempty"`
 	Args      json.RawMessage `json:"args,omitempty"`
 }
 
-// PermissionResult is the callback result for request_permission.
-type PermissionResult struct {
-	Allow  bool   `json:"allow"`
-	Reason string `json:"reason,omitempty"`
-}
-
-// CanUseToolFunc decides whether a tool invocation should be allowed.
-type CanUseToolFunc func(ctx context.Context, req PermissionRequest) (PermissionResult, error)
+// CanUseToolFunc selects which permission option should be applied.
+type CanUseToolFunc func(ctx context.Context, call ToolCallInfo, options []PermissionOption) (selectedOptionID string, err error)

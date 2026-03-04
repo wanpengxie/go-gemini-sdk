@@ -76,6 +76,59 @@ func TestClientConnectSendReceiveAndClose(t *testing.T) {
 }
 
 func TestClientHandlesRequestPermission(t *testing.T) {
+	got := runPermissionRoundtrip(
+		t,
+		`{"session_id":"s-1","tool_name":"bash","reason":"need shell","args":{"command":"rm -rf /tmp/data"},"options":[{"id":"allow_once"},{"id":"reject_once"}]}`,
+		WithCanUseTool(func(ctx context.Context, call ToolCallInfo, options []PermissionOption) (string, error) {
+			if call.ToolName != "bash" {
+				t.Fatalf("tool_name = %q, want bash", call.ToolName)
+			}
+			if call.ToolKind != ToolKindBash {
+				t.Fatalf("tool_kind = %q, want %q", call.ToolKind, ToolKindBash)
+			}
+			if len(options) != 2 {
+				t.Fatalf("options len = %d, want 2", len(options))
+			}
+			return "reject_once", nil
+		}),
+	)
+
+	if got.SelectedOptionID != "reject_once" {
+		t.Fatalf("selected_option_id = %q, want %q", got.SelectedOptionID, "reject_once")
+	}
+}
+
+func TestClientPermissionFallbackPrefersReject(t *testing.T) {
+	got := runPermissionRoundtrip(
+		t,
+		`{"session_id":"s-1","tool_name":"bash","options":[{"id":"allow_once"},{"id":"reject_once"}]}`,
+	)
+	if got.SelectedOptionID != "reject_once" {
+		t.Fatalf("selected_option_id = %q, want %q", got.SelectedOptionID, "reject_once")
+	}
+}
+
+func TestClientPermissionFallbackAllowThenFirst(t *testing.T) {
+	got := runPermissionRoundtrip(
+		t,
+		`{"session_id":"s-1","tool_name":"read","options":[{"id":"ask_once"},{"id":"allow_once"}]}`,
+	)
+	if got.SelectedOptionID != "allow_once" {
+		t.Fatalf("selected_option_id = %q, want %q", got.SelectedOptionID, "allow_once")
+	}
+
+	got = runPermissionRoundtrip(
+		t,
+		`{"session_id":"s-1","tool_name":"read","options":[{"id":"ask_once"},{"id":"manual_review"}]}`,
+	)
+	if got.SelectedOptionID != "ask_once" {
+		t.Fatalf("selected_option_id = %q, want %q", got.SelectedOptionID, "ask_once")
+	}
+}
+
+func runPermissionRoundtrip(t *testing.T, permissionParams string, extraOpts ...Option) requestPermissionResult {
+	t.Helper()
+
 	permResultCh := make(chan requestPermissionResult, 1)
 
 	runner := &testRunner{
@@ -85,8 +138,8 @@ func TestClientHandlesRequestPermission(t *testing.T) {
 					_ = enc.Encode(jsonrpcMessage{
 						JSONRPC: jsonrpcVersion,
 						ID:      json.RawMessage("99"),
-						Method:  methodRequestPermission,
-						Params:  json.RawMessage(`{"session_id":"s-1","tool_name":"bash","reason":"need shell"}`),
+						Method:  methodSessionRequestPermission,
+						Params:  json.RawMessage(permissionParams),
 					})
 
 					var permResp jsonrpcMessage
@@ -115,18 +168,14 @@ func TestClientHandlesRequestPermission(t *testing.T) {
 		},
 	}
 
-	client := NewClient(
+	clientOpts := []Option{
 		WithRunner(runner),
 		WithBinaryPath("/tmp/mock-gemini"),
 		WithRequestTimeout(time.Second),
-		WithCloseTimeout(2*time.Second),
-		WithCanUseTool(func(ctx context.Context, req PermissionRequest) (PermissionResult, error) {
-			if req.ToolName != "bash" {
-				t.Fatalf("tool_name = %q, want bash", req.ToolName)
-			}
-			return PermissionResult{Allow: false, Reason: "blocked by policy"}, nil
-		}),
-	)
+		WithCloseTimeout(2 * time.Second),
+	}
+	clientOpts = append(clientOpts, extraOpts...)
+	client := NewClient(clientOpts...)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -141,14 +190,9 @@ func TestClientHandlesRequestPermission(t *testing.T) {
 	}
 	_ = waitTurnEvents(t, events, errs, 2*time.Second)
 
+	var out requestPermissionResult
 	select {
-	case got := <-permResultCh:
-		if got.Allow {
-			t.Fatalf("permission allow = true, want false")
-		}
-		if got.Reason != "blocked by policy" {
-			t.Fatalf("permission reason = %q", got.Reason)
-		}
+	case out = <-permResultCh:
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting permission response")
 	}
@@ -156,6 +200,7 @@ func TestClientHandlesRequestPermission(t *testing.T) {
 	if err := client.CloseContext(ctx); err != nil {
 		t.Fatalf("CloseContext() error = %v", err)
 	}
+	return out
 }
 
 func waitTurnEvents(t *testing.T, events <-chan SessionEvent, errs <-chan error, timeout time.Duration) []SessionEvent {

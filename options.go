@@ -24,6 +24,10 @@ type options struct {
 	workDir           string
 	model             string
 	sandbox           string
+	approvalMode      string
+	allowedTools      []string
+	excludedTools     []string
+	addDirs           []string
 	startupTimeout    time.Duration
 	requestTimeout    time.Duration
 	closeTimeout      time.Duration
@@ -85,6 +89,34 @@ func WithModel(model string) Option {
 func WithSandbox(mode string) Option {
 	return func(o *options) {
 		o.sandbox = mode
+	}
+}
+
+// WithApprovalMode sets native CLI approval mode.
+func WithApprovalMode(mode string) Option {
+	return func(o *options) {
+		o.approvalMode = mode
+	}
+}
+
+// WithAllowedTools sets native CLI allowlist.
+func WithAllowedTools(tools []string) Option {
+	return func(o *options) {
+		o.allowedTools = append([]string(nil), tools...)
+	}
+}
+
+// WithExcludedTools sets native CLI denylist.
+func WithExcludedTools(tools []string) Option {
+	return func(o *options) {
+		o.excludedTools = append([]string(nil), tools...)
+	}
+}
+
+// WithAddDirs appends include-directories for native CLI policy.
+func WithAddDirs(dirs ...string) Option {
+	return func(o *options) {
+		o.addDirs = append(o.addDirs, dirs...)
 	}
 }
 

@@ -3,12 +3,13 @@ package gemini
 import "encoding/json"
 
 const (
-	methodInitialize        = "initialize"
-	methodSessionNew        = "session/new"
-	methodSessionPrompt     = "session/prompt"
-	methodSessionUpdate     = "session/update"
-	methodSessionInterrupt  = "session/interrupt"
-	methodRequestPermission = "request_permission"
+	methodInitialize               = "initialize"
+	methodSessionNew               = "session/new"
+	methodSessionPrompt            = "session/prompt"
+	methodSessionUpdate            = "session/update"
+	methodSessionInterrupt         = "session/interrupt"
+	methodRequestPermission        = "request_permission"
+	methodSessionRequestPermission = "session/request_permission"
 )
 
 type initializeParams struct {
@@ -59,13 +60,22 @@ type sessionUpdateParams struct {
 }
 
 type requestPermissionParams struct {
-	SessionID string          `json:"session_id,omitempty"`
-	ToolName  string          `json:"tool_name,omitempty"`
-	Reason    string          `json:"reason,omitempty"`
-	Args      json.RawMessage `json:"args,omitempty"`
+	SessionID string                     `json:"session_id,omitempty"`
+	ToolName  string                     `json:"tool_name,omitempty"`
+	ToolKind  ToolKind                   `json:"tool_kind,omitempty"`
+	Reason    string                     `json:"reason,omitempty"`
+	Args      json.RawMessage            `json:"args,omitempty"`
+	Options   []PermissionOption         `json:"options,omitempty"`
+	ToolCall  *requestPermissionToolCall `json:"tool_call,omitempty"`
+}
+
+type requestPermissionToolCall struct {
+	Name string          `json:"name,omitempty"`
+	Kind ToolKind        `json:"kind,omitempty"`
+	Args json.RawMessage `json:"args,omitempty"`
 }
 
 type requestPermissionResult struct {
-	Allow  bool   `json:"allow"`
-	Reason string `json:"reason,omitempty"`
+	SelectedOptionID string `json:"selected_option_id,omitempty"`
+	OptionID         string `json:"option_id,omitempty"`
 }
