@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
 	gemini "github.com/wanpengxie/go-gemini-sdk"
@@ -13,7 +14,11 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	client := gemini.NewClient()
+	opts := make([]gemini.Option, 0, 1)
+	if bin := os.Getenv("GEMINI_BINARY"); bin != "" {
+		opts = append(opts, gemini.WithBinaryPath(bin))
+	}
+	client := gemini.NewClient(opts...)
 	if err := client.Connect(ctx); err != nil {
 		log.Fatalf("connect failed: %v", err)
 	}
@@ -21,7 +26,7 @@ func main() {
 		_ = client.Close()
 	}()
 
-	events, errs := client.ReceiveWithErrors()
+	messages, errs := client.ReceiveMessagesWithErrors()
 	prompts := []string{
 		"你好，请介绍一下你自己。",
 		"把上一句压缩成 10 个字以内。",
@@ -40,14 +45,23 @@ func main() {
 				if err != nil {
 					log.Fatalf("receive error: %v", err)
 				}
-			case ev, ok := <-events:
+			case msg, ok := <-messages:
 				if !ok {
 					return
 				}
-				if ev.Text != "" {
-					fmt.Print(ev.Text)
+				switch msg.Kind {
+				case gemini.BlockKindText, gemini.BlockKindThinking:
+					if msg.Text != "" {
+						fmt.Print(msg.Text)
+					}
+				case gemini.BlockKindToolCall:
+					fmt.Printf("\n[tool_call] name=%s id=%s\n", msg.ToolName, msg.ToolCallID)
+				case gemini.BlockKindToolResult:
+					fmt.Printf("\n[tool_result] name=%s id=%s\n", msg.ToolName, msg.ToolCallID)
+				case gemini.BlockKindError:
+					log.Fatalf("model error: %s", msg.Error)
 				}
-				if ev.Done || ev.Type == gemini.EventTypeCompleted {
+				if msg.Done || msg.Kind == gemini.BlockKindDone {
 					fmt.Println()
 					goto nextTurn
 				}

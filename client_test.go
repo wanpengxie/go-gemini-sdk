@@ -75,6 +75,196 @@ func TestClientConnectSendReceiveAndClose(t *testing.T) {
 	}
 }
 
+func TestClientReceiveBlocksWithErrors(t *testing.T) {
+	runner := &testRunner{
+		startFn: func(ctx context.Context, binary string, args []string, env []string, cwd string) (*processHandle, error) {
+			cfg := mockACPConfig{
+				onPrompt: func(state *mockACPState, req jsonrpcMessage, dec *json.Decoder, enc *json.Encoder) {
+					state.turn++
+					turnID := fmt.Sprintf("t-%d", state.turn)
+					_ = enc.Encode(jsonrpcMessage{
+						JSONRPC: jsonrpcVersion,
+						ID:      req.ID,
+						Result:  mustRawJSON(t, sessionPromptResult{Accepted: true, TurnID: turnID}),
+					})
+					_ = enc.Encode(jsonrpcMessage{
+						JSONRPC: jsonrpcVersion,
+						Method:  methodSessionUpdate,
+						Params: mustRawJSON(t, sessionUpdateParams{
+							SessionID: "s-1",
+							Type:      "agent_thought_chunk",
+							TurnID:    turnID,
+							Text:      "先分析上下文",
+						}),
+					})
+					_ = enc.Encode(jsonrpcMessage{
+						JSONRPC: jsonrpcVersion,
+						Method:  methodSessionUpdate,
+						Params: mustRawJSON(t, sessionUpdateParams{
+							SessionID:  "s-1",
+							Type:       string(EventTypeToolCall),
+							TurnID:     turnID,
+							ToolName:   "bash",
+							ToolCallID: "tool-1",
+							Data:       mustRawJSON(t, map[string]any{"command": "ls -la"}),
+						}),
+					})
+					_ = enc.Encode(jsonrpcMessage{
+						JSONRPC: jsonrpcVersion,
+						Method:  methodSessionUpdate,
+						Params: mustRawJSON(t, sessionUpdateParams{
+							SessionID:  "s-1",
+							Type:       string(EventTypeToolCallUpdate),
+							TurnID:     turnID,
+							ToolName:   "bash",
+							ToolCallID: "tool-1",
+							Data:       mustRawJSON(t, map[string]any{"exitCode": 0, "stdout": "ok"}),
+						}),
+					})
+					_ = enc.Encode(jsonrpcMessage{
+						JSONRPC: jsonrpcVersion,
+						Method:  methodSessionUpdate,
+						Params: mustRawJSON(t, sessionUpdateParams{
+							SessionID: "s-1",
+							Type:      "agent_message_chunk",
+							TurnID:    turnID,
+							Text:      "执行完成",
+						}),
+					})
+					_ = enc.Encode(jsonrpcMessage{
+						JSONRPC: jsonrpcVersion,
+						Method:  methodSessionUpdate,
+						Params: mustRawJSON(t, sessionUpdateParams{
+							SessionID: "s-1",
+							Type:      string(EventTypeCompleted),
+							TurnID:    turnID,
+							Done:      true,
+						}),
+					})
+				},
+			}
+			return newMockACPProcess(t, cfg), nil
+		},
+	}
+
+	client := NewClient(
+		WithRunner(runner),
+		WithBinaryPath("/tmp/mock-gemini"),
+		WithRequestTimeout(time.Second),
+		WithCloseTimeout(2*time.Second),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	blocks, errs := client.ReceiveBlocksWithErrors()
+	if err := client.Send(ctx, "do-work"); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+	turnBlocks := waitTurnBlocks(t, blocks, errs, 2*time.Second)
+	if len(turnBlocks) != 5 {
+		t.Fatalf("turn blocks len = %d, want 5", len(turnBlocks))
+	}
+	if turnBlocks[0].Kind != BlockKindThinking {
+		t.Fatalf("block[0].Kind = %q, want %q", turnBlocks[0].Kind, BlockKindThinking)
+	}
+	if turnBlocks[0].RawType != "agent_thought_chunk" {
+		t.Fatalf("block[0].RawType = %q, want agent_thought_chunk", turnBlocks[0].RawType)
+	}
+	if turnBlocks[1].Kind != BlockKindToolCall {
+		t.Fatalf("block[1].Kind = %q, want %q", turnBlocks[1].Kind, BlockKindToolCall)
+	}
+	if turnBlocks[2].Kind != BlockKindToolResult {
+		t.Fatalf("block[2].Kind = %q, want %q", turnBlocks[2].Kind, BlockKindToolResult)
+	}
+	if turnBlocks[3].Kind != BlockKindText {
+		t.Fatalf("block[3].Kind = %q, want %q", turnBlocks[3].Kind, BlockKindText)
+	}
+	if turnBlocks[4].Kind != BlockKindDone {
+		t.Fatalf("block[4].Kind = %q, want %q", turnBlocks[4].Kind, BlockKindDone)
+	}
+
+	if err := client.CloseContext(ctx); err != nil {
+		t.Fatalf("CloseContext() error = %v", err)
+	}
+}
+
+func TestClientReceiveMessagesAlias(t *testing.T) {
+	runner := &testRunner{
+		startFn: func(ctx context.Context, binary string, args []string, env []string, cwd string) (*processHandle, error) {
+			cfg := mockACPConfig{
+				onPrompt: func(state *mockACPState, req jsonrpcMessage, dec *json.Decoder, enc *json.Encoder) {
+					state.turn++
+					turnID := fmt.Sprintf("t-%d", state.turn)
+					_ = enc.Encode(jsonrpcMessage{
+						JSONRPC: jsonrpcVersion,
+						ID:      req.ID,
+						Result:  mustRawJSON(t, sessionPromptResult{Accepted: true, TurnID: turnID}),
+					})
+					_ = enc.Encode(jsonrpcMessage{
+						JSONRPC: jsonrpcVersion,
+						Method:  methodSessionUpdate,
+						Params: mustRawJSON(t, sessionUpdateParams{
+							SessionID: "s-1",
+							Type:      "agent_message_chunk",
+							TurnID:    turnID,
+							Text:      "hello",
+						}),
+					})
+					_ = enc.Encode(jsonrpcMessage{
+						JSONRPC: jsonrpcVersion,
+						Method:  methodSessionUpdate,
+						Params: mustRawJSON(t, sessionUpdateParams{
+							SessionID: "s-1",
+							Type:      string(EventTypeCompleted),
+							TurnID:    turnID,
+							Done:      true,
+						}),
+					})
+				},
+			}
+			return newMockACPProcess(t, cfg), nil
+		},
+	}
+
+	client := NewClient(
+		WithRunner(runner),
+		WithBinaryPath("/tmp/mock-gemini"),
+		WithRequestTimeout(time.Second),
+		WithCloseTimeout(2*time.Second),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	msgs, errs := client.ReceiveMessagesWithErrors()
+	if err := client.Send(ctx, "ping"); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+	turn := waitTurnBlocks(t, msgs, errs, 2*time.Second)
+	if len(turn) != 2 {
+		t.Fatalf("turn blocks len = %d, want 2", len(turn))
+	}
+	if turn[0].Kind != BlockKindText {
+		t.Fatalf("turn[0].Kind = %q, want %q", turn[0].Kind, BlockKindText)
+	}
+	if turn[1].Kind != BlockKindDone {
+		t.Fatalf("turn[1].Kind = %q, want %q", turn[1].Kind, BlockKindDone)
+	}
+
+	if err := client.CloseContext(ctx); err != nil {
+		t.Fatalf("CloseContext() error = %v", err)
+	}
+}
+
 func TestClientHandlesRequestPermission(t *testing.T) {
 	got := runPermissionRoundtrip(
 		t,
@@ -93,8 +283,12 @@ func TestClientHandlesRequestPermission(t *testing.T) {
 		}),
 	)
 
-	if got.SelectedOptionID != "reject_once" {
-		t.Fatalf("selected_option_id = %q, want %q", got.SelectedOptionID, "reject_once")
+	if got.Outcome == nil || got.Outcome.OptionID != "reject_once" {
+		gotID := ""
+		if got.Outcome != nil {
+			gotID = got.Outcome.OptionID
+		}
+		t.Fatalf("outcome.optionId = %q, want %q", gotID, "reject_once")
 	}
 }
 
@@ -103,8 +297,12 @@ func TestClientPermissionFallbackPrefersReject(t *testing.T) {
 		t,
 		`{"session_id":"s-1","tool_name":"bash","options":[{"id":"allow_once"},{"id":"reject_once"}]}`,
 	)
-	if got.SelectedOptionID != "reject_once" {
-		t.Fatalf("selected_option_id = %q, want %q", got.SelectedOptionID, "reject_once")
+	if got.Outcome == nil || got.Outcome.OptionID != "reject_once" {
+		gotID := ""
+		if got.Outcome != nil {
+			gotID = got.Outcome.OptionID
+		}
+		t.Fatalf("outcome.optionId = %q, want %q", gotID, "reject_once")
 	}
 }
 
@@ -113,16 +311,24 @@ func TestClientPermissionFallbackAllowThenFirst(t *testing.T) {
 		t,
 		`{"session_id":"s-1","tool_name":"read","options":[{"id":"ask_once"},{"id":"allow_once"}]}`,
 	)
-	if got.SelectedOptionID != "allow_once" {
-		t.Fatalf("selected_option_id = %q, want %q", got.SelectedOptionID, "allow_once")
+	if got.Outcome == nil || got.Outcome.OptionID != "allow_once" {
+		gotID := ""
+		if got.Outcome != nil {
+			gotID = got.Outcome.OptionID
+		}
+		t.Fatalf("outcome.optionId = %q, want %q", gotID, "allow_once")
 	}
 
 	got = runPermissionRoundtrip(
 		t,
 		`{"session_id":"s-1","tool_name":"read","options":[{"id":"ask_once"},{"id":"manual_review"}]}`,
 	)
-	if got.SelectedOptionID != "ask_once" {
-		t.Fatalf("selected_option_id = %q, want %q", got.SelectedOptionID, "ask_once")
+	if got.Outcome == nil || got.Outcome.OptionID != "ask_once" {
+		gotID := ""
+		if got.Outcome != nil {
+			gotID = got.Outcome.OptionID
+		}
+		t.Fatalf("outcome.optionId = %q, want %q", gotID, "ask_once")
 	}
 }
 
@@ -231,6 +437,34 @@ func waitTurnEvents(t *testing.T, events <-chan SessionEvent, errs <-chan error,
 	}
 }
 
+func waitTurnBlocks(t *testing.T, blocks <-chan StreamBlock, errs <-chan error, timeout time.Duration) []StreamBlock {
+	t.Helper()
+	deadline := time.After(timeout)
+	var out []StreamBlock
+
+	for {
+		select {
+		case err, ok := <-errs:
+			if !ok {
+				err = nil
+			}
+			if err != nil {
+				t.Fatalf("receive error: %v", err)
+			}
+		case block, ok := <-blocks:
+			if !ok {
+				return out
+			}
+			out = append(out, block)
+			if block.Done || block.Kind == BlockKindDone || block.Kind == BlockKindError {
+				return out
+			}
+		case <-deadline:
+			t.Fatalf("timeout waiting blocks, collected=%d", len(out))
+		}
+	}
+}
+
 type mockACPConfig struct {
 	onPrompt func(state *mockACPState, req jsonrpcMessage, dec *json.Decoder, enc *json.Encoder)
 }
@@ -278,13 +512,13 @@ func newMockACPProcess(t *testing.T, cfg mockACPConfig) *processHandle {
 				_ = enc.Encode(jsonrpcMessage{
 					JSONRPC: jsonrpcVersion,
 					ID:      msg.ID,
-					Result:  mustRawJSON(t, initializeResult{ProtocolVersion: "1.0"}),
+					Result:  mustRawJSON(t, initializeResult{ProtocolVersion: 1}),
 				})
 			case methodSessionNew:
 				_ = enc.Encode(jsonrpcMessage{
 					JSONRPC: jsonrpcVersion,
 					ID:      msg.ID,
-					Result:  mustRawJSON(t, sessionNewResult{SessionID: "s-1"}),
+					Result:  mustRawJSON(t, sessionNewResult{SessionIDV2: "s-1"}),
 				})
 			case methodSessionPrompt:
 				if cfg.onPrompt != nil {
@@ -294,6 +528,15 @@ func newMockACPProcess(t *testing.T, cfg mockACPConfig) *processHandle {
 
 				var in sessionPromptParams
 				_ = json.Unmarshal(msg.Params, &in)
+				promptText := ""
+				for _, block := range in.Prompt {
+					if block.Type == "text" {
+						promptText += block.Text
+					}
+				}
+				if promptText == "" {
+					promptText = "unknown"
+				}
 				state.turn++
 				turnID := fmt.Sprintf("t-%d", state.turn)
 				_ = enc.Encode(jsonrpcMessage{
@@ -308,7 +551,7 @@ func newMockACPProcess(t *testing.T, cfg mockACPConfig) *processHandle {
 						SessionID: "s-1",
 						Type:      string(EventTypeMessageChunk),
 						TurnID:    turnID,
-						Text:      "reply:" + in.Prompt,
+						Text:      "reply:" + promptText,
 					}),
 				})
 				_ = enc.Encode(jsonrpcMessage{

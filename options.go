@@ -2,16 +2,28 @@ package gemini
 
 import (
 	"context"
+	"strings"
 	"time"
 )
 
 const (
 	defaultStartupTimeout    = 30 * time.Second
-	defaultRequestTimeout    = 60 * time.Second
+	defaultRequestTimeout    = 300 * time.Second
 	defaultCloseTimeout      = 10 * time.Second
 	defaultMaxEventBytes     = 2 << 20 // 2 MiB
 	defaultStderrBufferBytes = 8 << 10 // 8 KiB
 	defaultEventBuffer       = 128
+)
+
+const (
+	// ApprovalModeDefault prompts for approval.
+	ApprovalModeDefault = "default"
+	// ApprovalModeAutoEdit auto-approves edit tools.
+	ApprovalModeAutoEdit = "auto_edit"
+	// ApprovalModeYolo auto-approves all tools.
+	ApprovalModeYolo = "yolo"
+	// ApprovalModePlan runs in plan/read-only mode.
+	ApprovalModePlan = "plan"
 )
 
 // Option configures Client.
@@ -24,10 +36,12 @@ type options struct {
 	workDir           string
 	model             string
 	sandbox           string
+	sandboxEnabled    *bool
 	approvalMode      string
 	allowedTools      []string
 	excludedTools     []string
 	addDirs           []string
+	policyPaths       []string
 	startupTimeout    time.Duration
 	requestTimeout    time.Duration
 	closeTimeout      time.Duration
@@ -92,11 +106,23 @@ func WithSandbox(mode string) Option {
 	}
 }
 
+// WithSandboxEnabled toggles Gemini CLI native sandbox switch (--sandbox).
+func WithSandboxEnabled(enabled bool) Option {
+	return func(o *options) {
+		o.sandboxEnabled = &enabled
+	}
+}
+
 // WithApprovalMode sets native CLI approval mode.
 func WithApprovalMode(mode string) Option {
 	return func(o *options) {
 		o.approvalMode = mode
 	}
+}
+
+// WithApproveMode is an alias of WithApprovalMode.
+func WithApproveMode(mode string) Option {
+	return WithApprovalMode(mode)
 }
 
 // WithAllowedTools sets native CLI allowlist.
@@ -117,6 +143,19 @@ func WithExcludedTools(tools []string) Option {
 func WithAddDirs(dirs ...string) Option {
 	return func(o *options) {
 		o.addDirs = append(o.addDirs, dirs...)
+	}
+}
+
+// WithPolicyPaths appends Gemini native policy file/directories (--policy).
+func WithPolicyPaths(paths ...string) Option {
+	return func(o *options) {
+		for _, path := range paths {
+			path = strings.TrimSpace(path)
+			if path == "" {
+				continue
+			}
+			o.policyPaths = append(o.policyPaths, path)
+		}
 	}
 }
 
@@ -186,6 +225,11 @@ func WithCanUseTool(fn CanUseToolFunc) Option {
 	return func(o *options) {
 		o.canUseTool = fn
 	}
+}
+
+// WithApprovalCallback registers permission callback for request_permission requests.
+func WithApprovalCallback(fn CanUseToolFunc) Option {
+	return WithCanUseTool(fn)
 }
 
 func applyOptions(opts []Option) options {

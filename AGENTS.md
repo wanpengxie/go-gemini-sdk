@@ -38,6 +38,4 @@
 </dalek_bootstrap>
 <!-- DALEK:INJECT:END -->
 
-# 项目指令入口
-
 @.dalek/agent-kernel.md

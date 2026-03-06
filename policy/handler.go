@@ -2,6 +2,7 @@ package policy
 
 import (
 	"context"
+	"os"
 	"strings"
 
 	gemini "github.com/wanpengxie/go-gemini-sdk"
@@ -17,13 +18,23 @@ import (
 //	  "ask":   ["Bash(git push *)"]
 //	}
 func NewHandlerFromJSON(raw string) (gemini.CanUseToolFunc, error) {
+	baseDir, err := os.Getwd()
+	if err != nil {
+		baseDir = "."
+	}
+	return NewHandlerFromJSONWithBaseDir(raw, baseDir)
+}
+
+// NewHandlerFromJSONWithBaseDir parses policy JSON and anchors path rules to baseDir.
+func NewHandlerFromJSONWithBaseDir(raw string, baseDir string) (gemini.CanUseToolFunc, error) {
 	p, err := parsePolicyConfig(raw)
 	if err != nil {
 		return nil, err
 	}
+	baseDir = normalizeBaseDir(baseDir)
 
 	return func(_ context.Context, call gemini.ToolCallInfo, options []gemini.PermissionOption) (string, error) {
-		switch p.decide(call) {
+		switch p.decide(call, baseDir) {
 		case decisionDeny:
 			return findOptionByPrefix(options, "reject_"), nil
 		case decisionAsk:
@@ -42,7 +53,7 @@ func findOptionByPrefix(options []gemini.PermissionOption, prefix string) string
 		return ""
 	}
 	for _, option := range options {
-		id := strings.TrimSpace(option.ID)
+		id := option.OptionIDValue()
 		if id == "" {
 			continue
 		}

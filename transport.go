@@ -222,6 +222,8 @@ func buildCLIArgs(o options) []string {
 	}
 	if o.sandbox != "" {
 		args = append(args, "--sandbox", o.sandbox)
+	} else if o.sandboxEnabled != nil && *o.sandboxEnabled {
+		args = append(args, "--sandbox")
 	}
 	if o.approvalMode != "" {
 		args = append(args, "--approval-mode", o.approvalMode)
@@ -234,6 +236,13 @@ func buildCLIArgs(o options) []string {
 	}
 	if len(o.addDirs) > 0 {
 		args = append(args, "--include-directories", strings.Join(o.addDirs, ","))
+	}
+	for _, policyPath := range o.policyPaths {
+		policyPath = strings.TrimSpace(policyPath)
+		if policyPath == "" {
+			continue
+		}
+		args = append(args, "--policy", policyPath)
 	}
 	return args
 }

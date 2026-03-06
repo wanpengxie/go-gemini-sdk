@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -93,12 +95,14 @@ func (c *Client) Connect(ctx context.Context) error {
 	rpcConn.registerHandler(methodSessionRequestPermission, c.handlePermissionRequest)
 
 	if err := c.callInitialize(startupCtx, rpcConn); err != nil {
+		err = wrapProcessError("initialize", err, sanitizeStderrTail(ring.String()))
 		c.cleanupFailedConnect(handle, rpcConn, stderrDone)
 		return wrapOp("client.connect", err)
 	}
 
 	sessionID, err := c.callSessionNew(startupCtx, rpcConn)
 	if err != nil {
+		err = wrapProcessError("session_new", err, sanitizeStderrTail(ring.String()))
 		c.cleanupFailedConnect(handle, rpcConn, stderrDone)
 		return wrapOp("client.connect", err)
 	}
@@ -149,10 +153,28 @@ func (c *Client) Send(ctx context.Context, prompt string) error {
 	var result sessionPromptResult
 	err := rpcConn.call(requestCtx, methodSessionPrompt, sessionPromptParams{
 		SessionID: sessionID,
-		Prompt:    prompt,
+		Prompt: []promptContentBlock{
+			{Type: "text", Text: prompt},
+		},
 	}, &result)
 	if err != nil {
 		return wrapOp("client.send", err)
+	}
+
+	// ACP v1 ends a turn with PromptResponse.stopReason instead of a dedicated
+	// `session/update: completed` notification. Emit a synthetic completed event
+	// to preserve the existing Receive loop contract.
+	if strings.TrimSpace(result.StopReason) != "" {
+		raw, _ := json.Marshal(map[string]any{
+			"stopReason": result.StopReason,
+		})
+		c.emitEvent(SessionEvent{
+			Type:      EventTypeCompleted,
+			RawType:   "completed",
+			SessionID: sessionID,
+			Done:      true,
+			Data:      raw,
+		})
 	}
 	return nil
 }
@@ -171,6 +193,48 @@ func (c *Client) ReceiveWithErrors() (<-chan SessionEvent, <-chan error) {
 	return c.eventsCh, c.errsCh
 }
 
+// ReceiveBlocks returns a higher-level structured stream converted from SessionEvent.
+//
+// Do not consume Receive/ReceiveWithErrors and ReceiveBlocks/ReceiveBlocksWithErrors
+// concurrently for the same client, otherwise events may be split between consumers.
+func (c *Client) ReceiveBlocks() <-chan StreamBlock {
+	blocks, _ := c.ReceiveBlocksWithErrors()
+	return blocks
+}
+
+// ReceiveBlocksWithErrors returns structured block stream and asynchronous errors.
+//
+// Do not consume Receive/ReceiveWithErrors and ReceiveBlocks/ReceiveBlocksWithErrors
+// concurrently for the same client, otherwise events may be split between consumers.
+func (c *Client) ReceiveBlocksWithErrors() (<-chan StreamBlock, <-chan error) {
+	events, errs := c.ReceiveWithErrors()
+	blocks := make(chan StreamBlock, c.opts.eventBuffer)
+
+	go func() {
+		defer close(blocks)
+		for ev := range events {
+			block := ev.ToBlock()
+			select {
+			case blocks <- block:
+			default:
+				c.emitReceiveError(&ProtocolError{Method: methodSessionUpdate, Message: "block buffer full"})
+				return
+			}
+		}
+	}()
+	return blocks, errs
+}
+
+// ReceiveMessages is an alias of ReceiveBlocks for cross-SDK naming alignment.
+func (c *Client) ReceiveMessages() <-chan StreamBlock {
+	return c.ReceiveBlocks()
+}
+
+// ReceiveMessagesWithErrors is an alias of ReceiveBlocksWithErrors for cross-SDK naming alignment.
+func (c *Client) ReceiveMessagesWithErrors() (<-chan StreamBlock, <-chan error) {
+	return c.ReceiveBlocksWithErrors()
+}
+
 // Interrupt sends session/interrupt notification to Gemini CLI.
 func (c *Client) Interrupt(ctx context.Context) error {
 	rpcConn, sessionID, ok := c.snapshotActiveSession()
@@ -181,7 +245,9 @@ func (c *Client) Interrupt(ctx context.Context) error {
 	requestCtx, cancel := withTimeoutIfNeeded(ctx, c.opts.requestTimeout)
 	defer cancel()
 
-	err := rpcConn.notify(requestCtx, methodSessionInterrupt, sessionInterruptParams{SessionID: sessionID})
+	err := rpcConn.notify(requestCtx, methodSessionInterrupt, sessionInterruptParams{
+		SessionID: sessionID,
+	})
 	if err != nil {
 		if errors.Is(err, io.ErrClosedPipe) {
 			return nil
@@ -292,12 +358,18 @@ func (c *Client) callInitialize(ctx context.Context, rpcConn *conn) error {
 	defer cancel()
 
 	params := initializeParams{
-		ProtocolVersion: "1.0",
+		ProtocolVersion: 1,
 		ClientInfo: map[string]any{
 			"name":    "go-gemini-sdk",
 			"version": "0.1.0",
 		},
-		Capabilities: map[string]any{},
+		ClientCapabilities: map[string]any{
+			"fs": map[string]any{
+				"readTextFile":  false,
+				"writeTextFile": false,
+			},
+			"terminal": false,
+		},
 	}
 
 	var result initializeResult
@@ -311,19 +383,35 @@ func (c *Client) callSessionNew(ctx context.Context, rpcConn *conn) (string, err
 	requestCtx, cancel := withTimeoutIfNeeded(ctx, c.opts.requestTimeout)
 	defer cancel()
 
+	cwd := strings.TrimSpace(c.opts.workDir)
+	if cwd == "" {
+		if wd, err := os.Getwd(); err == nil {
+			cwd = wd
+		}
+	}
+	if cwd == "" {
+		cwd = "/"
+	}
+	if cwd != "" {
+		if abs, err := filepath.Abs(cwd); err == nil {
+			cwd = abs
+		}
+	}
+
 	params := sessionNewParams{
-		Model:   c.opts.model,
-		WorkDir: c.opts.workDir,
+		Cwd:        cwd,
+		MCPServers: []map[string]any{},
 	}
 
 	var result sessionNewResult
 	if err := rpcConn.call(requestCtx, methodSessionNew, params, &result); err != nil {
 		return "", err
 	}
-	if strings.TrimSpace(result.SessionID) == "" {
+	sessionID := result.EffectiveSessionID()
+	if strings.TrimSpace(sessionID) == "" {
 		return "", &ProtocolError{Method: methodSessionNew, Message: "empty session id"}
 	}
-	return result.SessionID, nil
+	return sessionID, nil
 }
 
 func (c *Client) handlePermissionRequest(ctx context.Context, raw json.RawMessage) (any, error) {
@@ -360,30 +448,45 @@ func (c *Client) handlePermissionRequest(ctx context.Context, raw json.RawMessag
 	}
 
 	return requestPermissionResult{
-		SelectedOptionID: selectedOptionID,
-		OptionID:         selectedOptionID,
+		Outcome: &requestPermissionOutcome{
+			Outcome:  "selected",
+			OptionID: selectedOptionID,
+		},
 	}, nil
 }
 
 func normalizeToolCallInfo(params requestPermissionParams) ToolCallInfo {
+	sessionID := strings.TrimSpace(params.SessionIDV2)
+	if sessionID == "" {
+		sessionID = strings.TrimSpace(params.SessionID)
+	}
+
+	toolCall := params.ToolCallV2
+	if toolCall == nil {
+		toolCall = params.ToolCall
+	}
+
 	call := ToolCallInfo{
-		SessionID: params.SessionID,
+		SessionID: sessionID,
 		ToolName:  strings.TrimSpace(params.ToolName),
 		ToolKind:  normalizeToolKind(params.ToolKind, params.ToolName),
 		Reason:    params.Reason,
 		Args:      params.Args,
 	}
-	if params.ToolCall == nil {
+	if toolCall == nil {
 		return call
 	}
 	if call.ToolName == "" {
-		call.ToolName = strings.TrimSpace(params.ToolCall.Name)
+		call.ToolName = strings.TrimSpace(toolCall.Name)
+	}
+	if call.ToolName == "" {
+		call.ToolName = strings.TrimSpace(toolCall.Title)
 	}
 	if call.ToolKind == ToolKindUnknown {
-		call.ToolKind = normalizeToolKind(params.ToolCall.Kind, params.ToolCall.Name)
+		call.ToolKind = normalizeToolKind(toolCall.Kind, toolCall.Name)
 	}
-	if len(call.Args) == 0 && len(params.ToolCall.Args) > 0 {
-		call.Args = params.ToolCall.Args
+	if len(call.Args) == 0 && len(toolCall.Args) > 0 {
+		call.Args = toolCall.Args
 	}
 	return call
 }
@@ -412,7 +515,7 @@ func pickSafeFallbackOption(options []PermissionOption) string {
 		return id
 	}
 	for _, option := range options {
-		if id := strings.TrimSpace(option.ID); id != "" {
+		if id := option.normalizedID(); id != "" {
 			return id
 		}
 	}
@@ -425,7 +528,7 @@ func findOptionByPrefix(options []PermissionOption, prefix string) string {
 		return ""
 	}
 	for _, option := range options {
-		id := strings.TrimSpace(option.ID)
+		id := option.normalizedID()
 		if id == "" {
 			continue
 		}
@@ -442,7 +545,7 @@ func hasPermissionOption(options []PermissionOption, selectedOptionID string) bo
 		return false
 	}
 	for _, option := range options {
-		if strings.TrimSpace(option.ID) == selectedOptionID {
+		if option.normalizedID() == selectedOptionID {
 			return true
 		}
 	}
@@ -464,18 +567,19 @@ func (c *Client) pumpNotifications(rpcConn *conn) {
 				continue
 			}
 		}
-
+		sessionID, rawType, text, toolName, toolCallID, done, eventErr, payload := normalizeSessionUpdate(update)
 		c.emitEvent(SessionEvent{
-			Type:       normalizeEventType(update.Type),
-			SessionID:  update.SessionID,
+			Type:       normalizeEventType(rawType),
+			RawType:    rawType,
+			SessionID:  sessionID,
 			TurnID:     update.TurnID,
 			Role:       update.Role,
-			Text:       update.Text,
-			ToolName:   update.ToolName,
-			ToolCallID: update.ToolCallID,
-			Done:       update.Done,
-			Error:      update.Error,
-			Data:       update.Data,
+			Text:       text,
+			ToolName:   toolName,
+			ToolCallID: toolCallID,
+			Done:       done,
+			Error:      eventErr,
+			Data:       payload,
 		})
 	}
 }
@@ -624,19 +728,82 @@ func (c *Client) cleanupFailedConnect(handle *processHandle, rpcConn *conn, stde
 	}
 }
 
+func normalizeSessionUpdate(update sessionUpdateParams) (sessionID, rawType, text, toolName, toolCallID string, done bool, eventErr string, payload json.RawMessage) {
+	if update.Update != nil {
+		sessionID = strings.TrimSpace(update.SessionIDV2)
+		if sessionID == "" {
+			sessionID = strings.TrimSpace(update.SessionID)
+		}
+		rawType = strings.TrimSpace(update.Update.SessionUpdate)
+		toolCallID = strings.TrimSpace(update.Update.ToolCallID)
+		toolName = strings.TrimSpace(update.Update.Title)
+		text = extractTextFromContent(update.Update.Content)
+		eventErr = strings.TrimSpace(update.Error)
+		if payloadBytes, err := json.Marshal(update.Update); err == nil {
+			payload = payloadBytes
+		}
+		return
+	}
+
+	sessionID = strings.TrimSpace(update.SessionID)
+	rawType = strings.TrimSpace(update.Type)
+	text = update.Text
+	toolName = update.ToolName
+	toolCallID = update.ToolCallID
+	done = update.Done
+	eventErr = update.Error
+	payload = update.Data
+	return
+}
+
+func extractTextFromContent(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+
+	var block struct {
+		Type string `json:"type"`
+		Text string `json:"text,omitempty"`
+	}
+	if err := json.Unmarshal(raw, &block); err == nil {
+		if strings.EqualFold(strings.TrimSpace(block.Type), "text") {
+			return block.Text
+		}
+	}
+
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text,omitempty"`
+	}
+	if err := json.Unmarshal(raw, &blocks); err != nil {
+		return ""
+	}
+
+	var out strings.Builder
+	for _, item := range blocks {
+		if !strings.EqualFold(strings.TrimSpace(item.Type), "text") {
+			continue
+		}
+		out.WriteString(item.Text)
+	}
+	return out.String()
+}
+
 func normalizeEventType(t string) EventType {
-	switch strings.TrimSpace(t) {
-	case string(EventTypeMessage):
+	switch strings.ToLower(strings.TrimSpace(t)) {
+	case string(EventTypeMessage), "agent_message":
 		return EventTypeMessage
-	case string(EventTypeMessageChunk):
+	case string(EventTypeMessageChunk), "agent_message_chunk", "user_message_chunk":
 		return EventTypeMessageChunk
-	case string(EventTypeToolCall):
+	case string(EventTypeThinking), "thinking_chunk", "thought", "thought_chunk", "agent_thought_chunk", "agent_thinking", "agent_thinking_chunk":
+		return EventTypeThinking
+	case string(EventTypeToolCall), "toolcall":
 		return EventTypeToolCall
-	case string(EventTypeToolCallUpdate):
+	case string(EventTypeToolCallUpdate), "tool_result", "tool_call_result", "tool_result_chunk":
 		return EventTypeToolCallUpdate
-	case string(EventTypeCompleted):
+	case string(EventTypeCompleted), "done", "turn_completed", "complete":
 		return EventTypeCompleted
-	case string(EventTypeError):
+	case string(EventTypeError), "failed":
 		return EventTypeError
 	default:
 		return EventTypeUnknown
