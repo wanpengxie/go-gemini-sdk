@@ -1,7 +1,20 @@
-// Package gemini provides a minimal ACP client SDK for Gemini CLI.
+// Package gemini provides a Claude-style ACP client SDK for Gemini CLI.
 //
-// The SDK starts a Gemini CLI subprocess and communicates with it via
-// ACP (JSON-RPC 2.0 over stdio). It supports initialize handshake, session
-// lifecycle, prompt sending, event receiving, permission callbacks, and
-// graceful shutdown.
+// The public API is centered around typed Message streams:
+//
+//	msgs, errs := gemini.Query(ctx, "Explain ACP")
+//	for msg := range msgs {
+//		switch m := msg.(type) {
+//		case *gemini.AssistantMessage:
+//			_ = m
+//		case *gemini.ResultMessage:
+//			_ = m
+//		}
+//	}
+//	if err := <-errs; err != nil {
+//		panic(err)
+//	}
+//
+// Stateful clients submit turns with Client.Query and receive a dedicated
+// TurnHandle instead of exposing raw session/update event streams.
 package gemini

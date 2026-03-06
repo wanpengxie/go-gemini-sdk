@@ -123,11 +123,6 @@ func WithApprovalMode(mode string) Option {
 	}
 }
 
-// WithApproveMode is an alias of WithApprovalMode.
-func WithApproveMode(mode string) Option {
-	return WithApprovalMode(mode)
-}
-
 // WithAllowedTools sets native CLI allowlist.
 func WithAllowedTools(tools []string) Option {
 	return func(o *options) {
@@ -207,7 +202,7 @@ func WithStderrBufferBytes(n int) Option {
 	}
 }
 
-// WithEventBuffer sets SessionEvent channel buffer size.
+// WithEventBuffer sets per-turn message buffering size.
 func WithEventBuffer(n int) Option {
 	return func(o *options) {
 		if n > 0 {
@@ -228,11 +223,6 @@ func WithCanUseTool(fn CanUseToolFunc) Option {
 	return func(o *options) {
 		o.canUseTool = fn
 	}
-}
-
-// WithApprovalCallback registers permission callback for request_permission requests.
-func WithApprovalCallback(fn CanUseToolFunc) Option {
-	return WithCanUseTool(fn)
 }
 
 func applyOptions(opts []Option) options {

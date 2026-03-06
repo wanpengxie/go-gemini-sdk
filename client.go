@@ -23,28 +23,21 @@ type Client struct {
 	stderrRing *stderrRing
 	stderrDone <-chan struct{}
 
-	sessionID string
-	binary    string
-	connected bool
-	closing   bool
-	closed    bool
+	sessionID  string
+	binary     string
+	connected  bool
+	closing    bool
+	closed     bool
+	activeTurn *TurnHandle
 
 	processDone   chan struct{}
 	processErr    error
 	launchCleanup func()
 
-	eventsCh chan SessionEvent
-	errsCh   chan error
-
 	lastErrMu sync.RWMutex
 	lastErr   error
 
 	pumpWG sync.WaitGroup
-
-	stopCh   chan struct{}
-	stopOnce sync.Once
-
-	closeOutputOnce sync.Once
 }
 
 // NewClient creates a client with functional options applied.
@@ -58,10 +51,7 @@ func NewClient(opts ...Option) *Client {
 	return &Client{
 		opts:        applied,
 		runner:      runner,
-		eventsCh:    make(chan SessionEvent, applied.eventBuffer),
-		errsCh:      make(chan error, 16),
 		processDone: nil,
-		stopCh:      make(chan struct{}),
 	}
 }
 
@@ -147,181 +137,41 @@ func (c *Client) Connect(ctx context.Context) error {
 	go c.pumpConnErrors(rpcConn)
 	go c.waitProcess()
 
-	go c.closeOutputsWhenStopped()
-
 	return nil
 }
 
-// Send submits one prompt turn and blocks until ACP acknowledges the turn.
-//
-// ACP v1 `session/prompt` is a synchronous request. This call waits for prompt
-// processing to complete (including prompt-level stopReason when provided), so
-// it does not return immediately after bytes are written.
-func (c *Client) Send(ctx context.Context, prompt string) error {
+// Query submits one prompt turn and returns a dedicated turn handle.
+func (c *Client) Query(ctx context.Context, prompt string) (*TurnHandle, error) {
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" {
-		return wrapOp("client.send", &ProtocolError{Method: methodSessionPrompt, Message: "empty prompt"})
+		return nil, wrapOp("client.query", &ProtocolError{Method: methodSessionPrompt, Message: "empty prompt"})
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, wrapOp("client.query", err)
 	}
 
-	rpcConn, sessionID, ok := c.snapshotActiveSession()
-	if !ok {
-		return wrapOp("client.send", c.connectionInactiveError("send"))
+	rpcConn, sessionID, turn, err := c.beginTurn()
+	if err != nil {
+		return nil, err
 	}
 
-	requestCtx, cancel := withTimeoutIfNeeded(ctx, c.opts.requestTimeout)
-	defer cancel()
-
-	var result sessionPromptResult
-	err := rpcConn.call(requestCtx, methodSessionPrompt, sessionPromptParams{
+	call, err := rpcConn.beginCall(methodSessionPrompt, sessionPromptParams{
 		SessionID: sessionID,
 		Prompt: []promptContentBlock{
 			{Type: "text", Text: prompt},
 		},
-	}, &result)
+	})
 	if err != nil {
+		c.releaseTurn(turn)
 		if errors.Is(err, io.ErrClosedPipe) {
-			return wrapOp("client.send", c.connectionInactiveError("send"))
+			return nil, wrapOp("client.query", c.connectionInactiveError("query"))
 		}
-		return wrapOp("client.send", err)
+		return nil, wrapOp("client.query", err)
 	}
 
-	// ACP v1 ends a turn with PromptResponse.stopReason instead of a dedicated
-	// `session/update: completed` notification. Emit a synthetic completed event
-	// to preserve the existing Receive loop contract.
-	if strings.TrimSpace(result.StopReason) != "" {
-		raw, _ := json.Marshal(map[string]any{
-			"stopReason": result.StopReason,
-		})
-		c.emitEvent(SessionEvent{
-			Type:      EventTypeCompleted,
-			RawType:   "completed",
-			SessionID: sessionID,
-			Done:      true,
-			Data:      raw,
-		})
-	}
-	return nil
-}
-
-// Receive returns the stream of normalized session/update events.
-func (c *Client) Receive() <-chan SessionEvent {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.eventsCh
-}
-
-// ReceiveWithErrors returns both event stream and asynchronous error stream.
-func (c *Client) ReceiveWithErrors() (<-chan SessionEvent, <-chan error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.eventsCh, c.errsCh
-}
-
-// ReceiveTurn collects events for one turn until completion, error, or ctx cancellation.
-//
-// Do not consume Receive/ReceiveWithErrors/ReceiveBlocks/ReceiveBlocksWithErrors
-// concurrently with ReceiveTurn for the same client, otherwise events may be
-// split between consumers.
-func (c *Client) ReceiveTurn(ctx context.Context) ([]SessionEvent, error) {
-	events, errs := c.ReceiveWithErrors()
-	turnEvents := make([]SessionEvent, 0, 8)
-
-	for events != nil || errs != nil {
-		select {
-		case <-ctx.Done():
-			return turnEvents, wrapOp("client.receive_turn", ctx.Err())
-		case err, ok := <-errs:
-			if !ok {
-				errs = nil
-				continue
-			}
-			if err != nil {
-				return turnEvents, wrapOp("client.receive_turn", err)
-			}
-		case ev, ok := <-events:
-			if !ok {
-				events = nil
-				continue
-			}
-
-			turnEvents = append(turnEvents, ev)
-			if err := turnErrorFromEvent(ev); err != nil {
-				return turnEvents, wrapOp("client.receive_turn", err)
-			}
-			if isTurnCompletedEvent(ev) {
-				return turnEvents, nil
-			}
-		}
-	}
-
-	if err := c.Err(); err != nil {
-		return turnEvents, wrapOp("client.receive_turn", err)
-	}
-	return turnEvents, nil
-}
-
-// ReceiveTurnBlocks is like ReceiveTurn but returns structured StreamBlock items.
-func (c *Client) ReceiveTurnBlocks(ctx context.Context) ([]StreamBlock, error) {
-	events, err := c.ReceiveTurn(ctx)
-	blocks := make([]StreamBlock, 0, len(events))
-	for _, ev := range events {
-		blocks = append(blocks, ev.ToBlock())
-	}
-	if err != nil {
-		return blocks, err
-	}
-	return blocks, nil
-}
-
-// ReceiveBlocks returns a higher-level structured stream converted from SessionEvent.
-//
-// Do not consume Receive/ReceiveWithErrors and ReceiveBlocks/ReceiveBlocksWithErrors
-// concurrently for the same client, otherwise events may be split between consumers.
-func (c *Client) ReceiveBlocks() <-chan StreamBlock {
-	blocks, _ := c.ReceiveBlocksWithErrors()
-	return blocks
-}
-
-// ReceiveBlocksWithErrors returns structured block stream and asynchronous errors.
-//
-// Do not consume Receive/ReceiveWithErrors and ReceiveBlocks/ReceiveBlocksWithErrors
-// concurrently for the same client, otherwise events may be split between consumers.
-func (c *Client) ReceiveBlocksWithErrors() (<-chan StreamBlock, <-chan error) {
-	events, errs := c.ReceiveWithErrors()
-	blocks := make(chan StreamBlock, c.opts.eventBuffer)
-	stopCh := c.stopCh
-
-	go func() {
-		defer close(blocks)
-		for ev := range events {
-			block := ev.ToBlock()
-			select {
-			case <-stopCh:
-				return
-			case blocks <- block:
-			}
-		}
-	}()
-	return blocks, errs
-}
-
-// ReceiveMessages is an alias of ReceiveBlocks for cross-SDK naming alignment.
-func (c *Client) ReceiveMessages() <-chan StreamBlock {
-	return c.ReceiveBlocks()
-}
-
-// ReceiveMessagesWithErrors is an alias of ReceiveBlocksWithErrors for cross-SDK naming alignment.
-func (c *Client) ReceiveMessagesWithErrors() (<-chan StreamBlock, <-chan error) {
-	return c.ReceiveBlocksWithErrors()
-}
-
-// SendAndReceive is a one-shot helper that sends one prompt and collects the
-// full turn as structured blocks.
-func (c *Client) SendAndReceive(ctx context.Context, prompt string) ([]StreamBlock, error) {
-	if err := c.Send(ctx, prompt); err != nil {
-		return nil, err
-	}
-	return c.ReceiveTurnBlocks(ctx)
+	waitCtx, cancel := withTimeoutIfNeeded(context.Background(), c.opts.requestTimeout)
+	go c.awaitPromptResult(waitCtx, cancel, call, turn)
+	return turn, nil
 }
 
 // Interrupt sends session/interrupt notification to Gemini CLI.
@@ -364,11 +214,6 @@ func (c *Client) CloseContext(ctx context.Context) error {
 	if !c.connected {
 		c.closed = true
 		c.mu.Unlock()
-		c.signalStopped()
-		c.closeOutputOnce.Do(func() {
-			close(c.eventsCh)
-			close(c.errsCh)
-		})
 		return nil
 	}
 
@@ -378,8 +223,12 @@ func (c *Client) CloseContext(ctx context.Context) error {
 	rpcConn := c.conn
 	processDone := c.processDone
 	closeTimeout := c.opts.closeTimeout
+	activeTurn := c.activeTurn
 	c.mu.Unlock()
-	c.signalStopped()
+
+	if activeTurn != nil {
+		activeTurn.fail(wrapOp("client.close", io.ErrClosedPipe))
+	}
 
 	closeCtx, cancel := withTimeoutIfNeeded(ctx, closeTimeout)
 	defer cancel()
@@ -419,7 +268,7 @@ func (c *Client) CloseContext(ctx context.Context) error {
 	if waitTimedOut {
 		err := wrapProcessError("close_timeout", closeCtx.Err(), c.stderrTail())
 		c.recordErr(err)
-		c.emitReceiveError(err)
+		c.routeTurnError(err)
 		return wrapOp("client.close", err)
 	}
 
@@ -654,12 +503,12 @@ func (c *Client) pumpNotifications(rpcConn *conn) {
 		var update sessionUpdateParams
 		if len(msg.Params) > 0 && string(msg.Params) != "null" {
 			if err := json.Unmarshal(msg.Params, &update); err != nil {
-				c.emitReceiveError(&ProtocolError{Method: methodSessionUpdate, Message: "invalid session update", Err: err})
+				c.routeTurnError(&ProtocolError{Method: methodSessionUpdate, Message: "invalid session update", Err: err})
 				continue
 			}
 		}
 		sessionID, rawType, text, toolName, toolCallID, done, eventErr, payload := normalizeSessionUpdate(update)
-		c.emitEvent(SessionEvent{
+		c.routeTurnEvent(sessionEvent{
 			Type:       normalizeEventType(rawType),
 			RawType:    rawType,
 			SessionID:  sessionID,
@@ -679,7 +528,7 @@ func (c *Client) pumpConnErrors(rpcConn *conn) {
 	defer c.pumpWG.Done()
 
 	for err := range rpcConn.Errors() {
-		c.emitReceiveError(wrapOp("client.read_loop", err))
+		c.routeTurnError(wrapOp("client.read_loop", err))
 	}
 }
 
@@ -708,9 +557,8 @@ func (c *Client) waitProcess() {
 	}
 
 	if waitErr != nil && !c.isClosing() {
-		c.emitReceiveError(processErr)
+		c.routeTurnError(processErr)
 	}
-	c.signalStopped()
 
 	if rpcConn != nil {
 		rpcConn.close()
@@ -719,12 +567,50 @@ func (c *Client) waitProcess() {
 	c.cleanupLaunchArtifacts()
 }
 
-func (c *Client) closeOutputsWhenStopped() {
-	c.pumpWG.Wait()
-	c.closeOutputOnce.Do(func() {
-		close(c.eventsCh)
-		close(c.errsCh)
+func (c *Client) beginTurn() (*conn, string, *TurnHandle, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.connected || c.conn == nil || c.sessionID == "" {
+		return nil, "", nil, wrapOp("client.query", c.connectionInactiveError("query"))
+	}
+	if c.activeTurn != nil {
+		return nil, "", nil, wrapOp("client.query", &ProtocolError{
+			Method:  methodSessionPrompt,
+			Message: "turn already in progress",
+		})
+	}
+
+	var turn *TurnHandle
+	turn = newTurnHandle(c.sessionID, c.opts.eventBuffer, func() {
+		c.releaseTurn(turn)
 	})
+	c.activeTurn = turn
+	return c.conn, c.sessionID, turn, nil
+}
+
+func (c *Client) releaseTurn(turn *TurnHandle) {
+	c.mu.Lock()
+	if c.activeTurn == turn {
+		c.activeTurn = nil
+	}
+	c.mu.Unlock()
+}
+
+func (c *Client) awaitPromptResult(ctx context.Context, cancel context.CancelFunc, call *pendingCall, turn *TurnHandle) {
+	defer cancel()
+
+	var result sessionPromptResult
+	err := call.wait(ctx, &result)
+	if err != nil {
+		if errors.Is(err, io.ErrClosedPipe) {
+			c.routeTurnError(wrapOp("client.query", c.connectionInactiveError("query")))
+			return
+		}
+		c.routeTurnError(wrapOp("client.query", err))
+		return
+	}
+	turn.handlePromptResult(result)
 }
 
 func (c *Client) snapshotActiveSession() (*conn, string, bool) {
@@ -736,29 +622,29 @@ func (c *Client) snapshotActiveSession() (*conn, string, bool) {
 	return c.conn, c.sessionID, true
 }
 
-func (c *Client) emitEvent(event SessionEvent) {
-	defer func() {
-		_ = recover()
-	}()
-	select {
-	case <-c.stopCh:
+func (c *Client) routeTurnEvent(event sessionEvent) {
+	turn := c.currentTurn()
+	if turn == nil {
 		return
-	case c.eventsCh <- event:
 	}
+	turn.handleEvent(event)
 }
 
-func (c *Client) emitReceiveError(err error) {
+func (c *Client) routeTurnError(err error) {
 	if err == nil {
 		return
 	}
 	c.recordErr(err)
-	defer func() {
-		_ = recover()
-	}()
-	select {
-	case c.errsCh <- err:
-	default:
+	turn := c.currentTurn()
+	if turn != nil {
+		turn.fail(err)
 	}
+}
+
+func (c *Client) currentTurn() *TurnHandle {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.activeTurn
 }
 
 func (c *Client) recordErr(err error) {
@@ -834,12 +720,6 @@ func (c *Client) cleanupLaunchArtifacts() {
 	}
 }
 
-func (c *Client) signalStopped() {
-	c.stopOnce.Do(func() {
-		close(c.stopCh)
-	})
-}
-
 func (c *Client) connectionInactiveError(op string) error {
 	cause := c.getProcessErr()
 	if cause == nil {
@@ -912,43 +792,24 @@ func extractTextFromContent(raw json.RawMessage) string {
 	return out.String()
 }
 
-func normalizeEventType(t string) EventType {
+func normalizeEventType(t string) eventType {
 	switch strings.ToLower(strings.TrimSpace(t)) {
-	case string(EventTypeMessage), "agent_message":
-		return EventTypeMessage
-	case string(EventTypeMessageChunk), "agent_message_chunk", "user_message_chunk":
-		return EventTypeMessageChunk
-	case string(EventTypeThinking), "thinking_chunk", "thought", "thought_chunk", "agent_thought_chunk", "agent_thinking", "agent_thinking_chunk":
-		return EventTypeThinking
-	case string(EventTypeToolCall), "toolcall":
-		return EventTypeToolCall
-	case string(EventTypeToolCallUpdate), "tool_result", "tool_call_result", "tool_result_chunk":
-		return EventTypeToolCallUpdate
-	case string(EventTypeCompleted), "done", "turn_completed", "complete":
-		return EventTypeCompleted
-	case string(EventTypeError), "failed":
-		return EventTypeError
+	case string(eventTypeMessage), "agent_message":
+		return eventTypeMessage
+	case string(eventTypeMessageChunk), "agent_message_chunk", "user_message_chunk":
+		return eventTypeMessageChunk
+	case string(eventTypeThinking), "thinking_chunk", "thought", "thought_chunk", "agent_thought_chunk", "agent_thinking", "agent_thinking_chunk":
+		return eventTypeThinking
+	case string(eventTypeToolCall), "toolcall":
+		return eventTypeToolCall
+	case string(eventTypeToolCallUpdate), "tool_result", "tool_call_result", "tool_result_chunk":
+		return eventTypeToolCallUpdate
+	case string(eventTypeCompleted), "done", "turn_completed", "complete":
+		return eventTypeCompleted
+	case string(eventTypeError), "failed":
+		return eventTypeError
 	default:
-		return EventTypeUnknown
-	}
-}
-
-func isTurnCompletedEvent(ev SessionEvent) bool {
-	return ev.Done || ev.Type == EventTypeCompleted
-}
-
-func turnErrorFromEvent(ev SessionEvent) error {
-	if ev.Type != EventTypeError && strings.TrimSpace(ev.Error) == "" {
-		return nil
-	}
-
-	msg := strings.TrimSpace(ev.Error)
-	if msg == "" {
-		msg = "session turn failed"
-	}
-	return &ProtocolError{
-		Method:  methodSessionUpdate,
-		Message: msg,
+		return eventTypeUnknown
 	}
 }
 

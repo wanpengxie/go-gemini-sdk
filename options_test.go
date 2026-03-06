@@ -1,9 +1,6 @@
 package gemini
 
-import (
-	"context"
-	"testing"
-)
+import "testing"
 
 func TestWithPolicyPathsSkipsEmpty(t *testing.T) {
 	o := applyOptions([]Option{
@@ -18,27 +15,6 @@ func TestWithPolicyPathsSkipsEmpty(t *testing.T) {
 	}
 	if o.policyPaths[1] != "/b" {
 		t.Fatalf("policyPaths[1] = %q, want %q", o.policyPaths[1], "/b")
-	}
-}
-
-func TestWithApprovalCallbackAlias(t *testing.T) {
-	called := false
-	cb := func(ctx context.Context, call ToolCallInfo, options []PermissionOption) (string, error) {
-		_ = ctx
-		_ = call
-		_ = options
-		called = true
-		return "", nil
-	}
-
-	o := applyOptions([]Option{WithApprovalCallback(cb)})
-	if o.canUseTool == nil {
-		t.Fatal("canUseTool is nil, want non-nil")
-	}
-
-	_, _ = o.canUseTool(context.Background(), ToolCallInfo{}, nil)
-	if !called {
-		t.Fatal("approval callback not invoked")
 	}
 }
 

@@ -19,12 +19,9 @@ func main() {
 		opts = append(opts, gemini.WithBinaryPath(bin))
 	}
 
-	blocks, errs, err := gemini.QueryBlocks(ctx, "解释一下 ACP 的 turn 概念", opts...)
-	if err != nil {
-		log.Fatalf("query blocks failed: %v", err)
-	}
+	messages, errs := gemini.Query(ctx, "解释一下 ACP 的 turn 概念", opts...)
 
-	for blocks != nil || errs != nil {
+	for messages != nil || errs != nil {
 		select {
 		case err, ok := <-errs:
 			if !ok {
@@ -34,23 +31,35 @@ func main() {
 			if err != nil {
 				log.Fatalf("stream error: %v", err)
 			}
-		case block, ok := <-blocks:
+		case msg, ok := <-messages:
 			if !ok {
-				blocks = nil
+				messages = nil
 				continue
 			}
-			switch block.Kind {
-			case gemini.BlockKindText, gemini.BlockKindThinking:
-				if block.Text != "" {
-					fmt.Print(block.Text)
-				}
-			case gemini.BlockKindToolCall:
-				fmt.Printf("\n[tool_call] %s (%s)\n", block.ToolName, block.ToolCallID)
-			case gemini.BlockKindToolResult:
-				fmt.Printf("\n[tool_result] %s (%s)\n", block.ToolName, block.ToolCallID)
-			case gemini.BlockKindDone:
+			if renderQueryMessage(msg) {
 				fmt.Println()
 			}
 		}
 	}
+}
+
+func renderQueryMessage(msg gemini.Message) bool {
+	switch m := msg.(type) {
+	case *gemini.AssistantMessage:
+		for _, block := range m.Content {
+			switch b := block.(type) {
+			case *gemini.TextBlock:
+				fmt.Print(b.Text)
+			case *gemini.ThinkingBlock:
+				fmt.Print(b.Thinking)
+			case *gemini.ToolUseBlock:
+				fmt.Printf("\n[tool_call] %s (%s)\n", b.Name, b.ID)
+			case *gemini.ToolResultBlock:
+				fmt.Printf("\n[tool_result] %s (%s)\n", b.Name, b.ToolUseID)
+			}
+		}
+	case *gemini.ResultMessage:
+		return true
+	}
+	return false
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -229,4 +230,85 @@ func TestConnCloseUnblocksPendingCall(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timeout waiting pending call to unblock")
 	}
+}
+
+func TestConnShutdownDuringWriteDoesNotDoubleClosePendingResponse(t *testing.T) {
+	stream := &blockingWriteStream{
+		writeStarted: make(chan struct{}),
+		releaseWrite: make(chan struct{}),
+		writeErr:     io.ErrClosedPipe,
+	}
+
+	rpcConn := &conn{
+		stream:   stream,
+		enc:      json.NewEncoder(stream),
+		dec:      json.NewDecoder(stream),
+		pending:  make(map[string]chan jsonrpcMessage),
+		handlers: make(map[string]rpcHandler),
+		notifyCh: make(chan jsonrpcMessage, 1),
+		errCh:    make(chan error, 1),
+		done:     make(chan struct{}),
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		errCh <- rpcConn.call(ctx, "ping", map[string]any{"value": 1}, nil)
+	}()
+
+	select {
+	case <-stream.writeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting write to start")
+	}
+
+	rpcConn.shutdown(io.ErrClosedPipe)
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("call() error = nil, want non-nil")
+		}
+		if !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("call() error = %v, want io.ErrClosedPipe", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting call to return")
+	}
+}
+
+type blockingWriteStream struct {
+	writeStarted chan struct{}
+	releaseWrite chan struct{}
+	writeErr     error
+
+	writeOnce sync.Once
+}
+
+func (s *blockingWriteStream) Read(p []byte) (int, error) {
+	return 0, io.EOF
+}
+
+func (s *blockingWriteStream) Write(p []byte) (int, error) {
+	s.writeOnce.Do(func() {
+		close(s.writeStarted)
+	})
+	<-s.releaseWrite
+	if s.writeErr != nil {
+		return 0, s.writeErr
+	}
+	return len(p), nil
+}
+
+func (s *blockingWriteStream) Close() error {
+	s.writeOnce.Do(func() {
+		close(s.writeStarted)
+	})
+	select {
+	case <-s.releaseWrite:
+	default:
+		close(s.releaseWrite)
+	}
+	return nil
 }

@@ -22,19 +22,8 @@ func (r *testRunner) Start(ctx context.Context, binary string, args []string, en
 	return r.startFn(ctx, binary, args, env, cwd)
 }
 
-func TestClientConnectSendReceiveAndClose(t *testing.T) {
-	runner := &testRunner{
-		startFn: func(ctx context.Context, binary string, args []string, env []string, cwd string) (*processHandle, error) {
-			return newMockACPProcess(t, mockACPConfig{}), nil
-		},
-	}
-
-	client := NewClient(
-		WithRunner(runner),
-		WithBinaryPath("/tmp/mock-gemini"),
-		WithRequestTimeout(time.Second),
-		WithCloseTimeout(2*time.Second),
-	)
+func TestClientConnectQueryAndClose(t *testing.T) {
+	client := newTestClient(t, mockACPConfig{})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -42,32 +31,19 @@ func TestClientConnectSendReceiveAndClose(t *testing.T) {
 	if err := client.Connect(ctx); err != nil {
 		t.Fatalf("Connect() error = %v", err)
 	}
-	if got := client.SessionID(); got == "" {
-		t.Fatal("SessionID() is empty")
-	}
 
-	events, errs := client.ReceiveWithErrors()
 	for i := 1; i <= 3; i++ {
 		prompt := fmt.Sprintf("round-%d", i)
-		if err := client.Send(ctx, prompt); err != nil {
-			t.Fatalf("Send(%q) error = %v", prompt, err)
+		turn, err := client.Query(ctx, prompt)
+		if err != nil {
+			t.Fatalf("Query(%q) error = %v", prompt, err)
 		}
 
-		turnEvents := waitTurnEvents(t, events, errs, 2*time.Second)
-		if len(turnEvents) < 2 {
-			t.Fatalf("turn events len = %d, want >= 2", len(turnEvents))
+		messages, recvErr := collectTurnMessages(t, turn, 2*time.Second)
+		if recvErr != nil {
+			t.Fatalf("turn recv error = %v", recvErr)
 		}
-		if turnEvents[0].Type != EventTypeMessageChunk {
-			t.Fatalf("first event type = %q, want %q", turnEvents[0].Type, EventTypeMessageChunk)
-		}
-		wantText := "reply:" + prompt
-		if turnEvents[0].Text != wantText {
-			t.Fatalf("first event text = %q, want %q", turnEvents[0].Text, wantText)
-		}
-		last := turnEvents[len(turnEvents)-1]
-		if !(last.Done || last.Type == EventTypeCompleted) {
-			t.Fatalf("last event not completed: %+v", last)
-		}
+		assertTurnText(t, messages, "reply:"+prompt)
 	}
 
 	if err := client.CloseContext(ctx); err != nil {
@@ -75,84 +51,73 @@ func TestClientConnectSendReceiveAndClose(t *testing.T) {
 	}
 }
 
-func TestClientReceiveBlocksWithErrors(t *testing.T) {
-	runner := &testRunner{
-		startFn: func(ctx context.Context, binary string, args []string, env []string, cwd string) (*processHandle, error) {
-			cfg := mockACPConfig{
-				onPrompt: func(state *mockACPState, req jsonrpcMessage, dec *json.Decoder, enc *json.Encoder) {
-					state.turn++
-					turnID := fmt.Sprintf("t-%d", state.turn)
-					_ = enc.Encode(jsonrpcMessage{
-						JSONRPC: jsonrpcVersion,
-						ID:      req.ID,
-						Result:  mustRawJSON(t, sessionPromptResult{Accepted: true, TurnID: turnID}),
-					})
-					_ = enc.Encode(jsonrpcMessage{
-						JSONRPC: jsonrpcVersion,
-						Method:  methodSessionUpdate,
-						Params: mustRawJSON(t, sessionUpdateParams{
-							SessionID: "s-1",
-							Type:      "agent_thought_chunk",
-							TurnID:    turnID,
-							Text:      "先分析上下文",
-						}),
-					})
-					_ = enc.Encode(jsonrpcMessage{
-						JSONRPC: jsonrpcVersion,
-						Method:  methodSessionUpdate,
-						Params: mustRawJSON(t, sessionUpdateParams{
-							SessionID:  "s-1",
-							Type:       string(EventTypeToolCall),
-							TurnID:     turnID,
-							ToolName:   "bash",
-							ToolCallID: "tool-1",
-							Data:       mustRawJSON(t, map[string]any{"command": "ls -la"}),
-						}),
-					})
-					_ = enc.Encode(jsonrpcMessage{
-						JSONRPC: jsonrpcVersion,
-						Method:  methodSessionUpdate,
-						Params: mustRawJSON(t, sessionUpdateParams{
-							SessionID:  "s-1",
-							Type:       string(EventTypeToolCallUpdate),
-							TurnID:     turnID,
-							ToolName:   "bash",
-							ToolCallID: "tool-1",
-							Data:       mustRawJSON(t, map[string]any{"exitCode": 0, "stdout": "ok"}),
-						}),
-					})
-					_ = enc.Encode(jsonrpcMessage{
-						JSONRPC: jsonrpcVersion,
-						Method:  methodSessionUpdate,
-						Params: mustRawJSON(t, sessionUpdateParams{
-							SessionID: "s-1",
-							Type:      "agent_message_chunk",
-							TurnID:    turnID,
-							Text:      "执行完成",
-						}),
-					})
-					_ = enc.Encode(jsonrpcMessage{
-						JSONRPC: jsonrpcVersion,
-						Method:  methodSessionUpdate,
-						Params: mustRawJSON(t, sessionUpdateParams{
-							SessionID: "s-1",
-							Type:      string(EventTypeCompleted),
-							TurnID:    turnID,
-							Done:      true,
-						}),
-					})
-				},
-			}
-			return newMockACPProcess(t, cfg), nil
+func TestClientQueryStreamsTypedMessages(t *testing.T) {
+	cfg := mockACPConfig{
+		onPrompt: func(state *mockACPState, req jsonrpcMessage, dec *json.Decoder, enc *json.Encoder) {
+			state.turn++
+			turnID := fmt.Sprintf("t-%d", state.turn)
+			_ = enc.Encode(jsonrpcMessage{
+				JSONRPC: jsonrpcVersion,
+				ID:      req.ID,
+				Result:  mustRawJSON(t, sessionPromptResult{Accepted: true, TurnID: turnID}),
+			})
+			_ = enc.Encode(jsonrpcMessage{
+				JSONRPC: jsonrpcVersion,
+				Method:  methodSessionUpdate,
+				Params: mustRawJSON(t, sessionUpdateParams{
+					SessionID: "s-1",
+					Type:      "agent_thought_chunk",
+					TurnID:    turnID,
+					Text:      "先分析上下文",
+				}),
+			})
+			_ = enc.Encode(jsonrpcMessage{
+				JSONRPC: jsonrpcVersion,
+				Method:  methodSessionUpdate,
+				Params: mustRawJSON(t, sessionUpdateParams{
+					SessionID:  "s-1",
+					Type:       string(eventTypeToolCall),
+					TurnID:     turnID,
+					ToolName:   "bash",
+					ToolCallID: "tool-1",
+					Data:       mustRawJSON(t, map[string]any{"command": "ls -la"}),
+				}),
+			})
+			_ = enc.Encode(jsonrpcMessage{
+				JSONRPC: jsonrpcVersion,
+				Method:  methodSessionUpdate,
+				Params: mustRawJSON(t, sessionUpdateParams{
+					SessionID:  "s-1",
+					Type:       string(eventTypeToolCallUpdate),
+					TurnID:     turnID,
+					ToolName:   "bash",
+					ToolCallID: "tool-1",
+					Data:       mustRawJSON(t, map[string]any{"exitCode": 0, "stdout": "ok"}),
+				}),
+			})
+			_ = enc.Encode(jsonrpcMessage{
+				JSONRPC: jsonrpcVersion,
+				Method:  methodSessionUpdate,
+				Params: mustRawJSON(t, sessionUpdateParams{
+					SessionID: "s-1",
+					Type:      "agent_message_chunk",
+					TurnID:    turnID,
+					Text:      "执行完成",
+				}),
+			})
+			_ = enc.Encode(jsonrpcMessage{
+				JSONRPC: jsonrpcVersion,
+				Method:  methodSessionUpdate,
+				Params: mustRawJSON(t, sessionUpdateParams{
+					SessionID: "s-1",
+					Type:      string(eventTypeCompleted),
+					TurnID:    turnID,
+					Done:      true,
+				}),
+			})
 		},
 	}
-
-	client := NewClient(
-		WithRunner(runner),
-		WithBinaryPath("/tmp/mock-gemini"),
-		WithRequestTimeout(time.Second),
-		WithCloseTimeout(2*time.Second),
-	)
+	client := newTestClient(t, cfg)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -160,355 +125,187 @@ func TestClientReceiveBlocksWithErrors(t *testing.T) {
 	if err := client.Connect(ctx); err != nil {
 		t.Fatalf("Connect() error = %v", err)
 	}
-
-	blocks, errs := client.ReceiveBlocksWithErrors()
-	if err := client.Send(ctx, "do-work"); err != nil {
-		t.Fatalf("Send() error = %v", err)
-	}
-	turnBlocks := waitTurnBlocks(t, blocks, errs, 2*time.Second)
-	if len(turnBlocks) != 5 {
-		t.Fatalf("turn blocks len = %d, want 5", len(turnBlocks))
-	}
-	if turnBlocks[0].Kind != BlockKindThinking {
-		t.Fatalf("block[0].Kind = %q, want %q", turnBlocks[0].Kind, BlockKindThinking)
-	}
-	if turnBlocks[0].RawType != "agent_thought_chunk" {
-		t.Fatalf("block[0].RawType = %q, want agent_thought_chunk", turnBlocks[0].RawType)
-	}
-	if turnBlocks[1].Kind != BlockKindToolCall {
-		t.Fatalf("block[1].Kind = %q, want %q", turnBlocks[1].Kind, BlockKindToolCall)
-	}
-	if turnBlocks[2].Kind != BlockKindToolResult {
-		t.Fatalf("block[2].Kind = %q, want %q", turnBlocks[2].Kind, BlockKindToolResult)
-	}
-	if turnBlocks[3].Kind != BlockKindText {
-		t.Fatalf("block[3].Kind = %q, want %q", turnBlocks[3].Kind, BlockKindText)
-	}
-	if turnBlocks[4].Kind != BlockKindDone {
-		t.Fatalf("block[4].Kind = %q, want %q", turnBlocks[4].Kind, BlockKindDone)
-	}
-
-	if err := client.CloseContext(ctx); err != nil {
-		t.Fatalf("CloseContext() error = %v", err)
-	}
-}
-
-func TestClientReceiveMessagesAlias(t *testing.T) {
-	runner := &testRunner{
-		startFn: func(ctx context.Context, binary string, args []string, env []string, cwd string) (*processHandle, error) {
-			cfg := mockACPConfig{
-				onPrompt: func(state *mockACPState, req jsonrpcMessage, dec *json.Decoder, enc *json.Encoder) {
-					state.turn++
-					turnID := fmt.Sprintf("t-%d", state.turn)
-					_ = enc.Encode(jsonrpcMessage{
-						JSONRPC: jsonrpcVersion,
-						ID:      req.ID,
-						Result:  mustRawJSON(t, sessionPromptResult{Accepted: true, TurnID: turnID}),
-					})
-					_ = enc.Encode(jsonrpcMessage{
-						JSONRPC: jsonrpcVersion,
-						Method:  methodSessionUpdate,
-						Params: mustRawJSON(t, sessionUpdateParams{
-							SessionID: "s-1",
-							Type:      "agent_message_chunk",
-							TurnID:    turnID,
-							Text:      "hello",
-						}),
-					})
-					_ = enc.Encode(jsonrpcMessage{
-						JSONRPC: jsonrpcVersion,
-						Method:  methodSessionUpdate,
-						Params: mustRawJSON(t, sessionUpdateParams{
-							SessionID: "s-1",
-							Type:      string(EventTypeCompleted),
-							TurnID:    turnID,
-							Done:      true,
-						}),
-					})
-				},
-			}
-			return newMockACPProcess(t, cfg), nil
-		},
-	}
-
-	client := NewClient(
-		WithRunner(runner),
-		WithBinaryPath("/tmp/mock-gemini"),
-		WithRequestTimeout(time.Second),
-		WithCloseTimeout(2*time.Second),
-	)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := client.Connect(ctx); err != nil {
-		t.Fatalf("Connect() error = %v", err)
-	}
-
-	msgs, errs := client.ReceiveMessagesWithErrors()
-	if err := client.Send(ctx, "ping"); err != nil {
-		t.Fatalf("Send() error = %v", err)
-	}
-	turn := waitTurnBlocks(t, msgs, errs, 2*time.Second)
-	if len(turn) != 2 {
-		t.Fatalf("turn blocks len = %d, want 2", len(turn))
-	}
-	if turn[0].Kind != BlockKindText {
-		t.Fatalf("turn[0].Kind = %q, want %q", turn[0].Kind, BlockKindText)
-	}
-	if turn[1].Kind != BlockKindDone {
-		t.Fatalf("turn[1].Kind = %q, want %q", turn[1].Kind, BlockKindDone)
-	}
-
-	if err := client.CloseContext(ctx); err != nil {
-		t.Fatalf("CloseContext() error = %v", err)
-	}
-}
-
-func TestClientReceiveTurnAndReceiveTurnBlocks(t *testing.T) {
-	runner := &testRunner{
-		startFn: func(ctx context.Context, binary string, args []string, env []string, cwd string) (*processHandle, error) {
-			return newMockACPProcess(t, mockACPConfig{}), nil
-		},
-	}
-
-	client := NewClient(
-		WithRunner(runner),
-		WithBinaryPath("/tmp/mock-gemini"),
-		WithRequestTimeout(time.Second),
-		WithCloseTimeout(2*time.Second),
-	)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := client.Connect(ctx); err != nil {
-		t.Fatalf("Connect() error = %v", err)
-	}
-
-	if err := client.Send(ctx, "hello"); err != nil {
-		t.Fatalf("Send() error = %v", err)
-	}
-	events, err := client.ReceiveTurn(ctx)
+	turn, err := client.Query(ctx, "do-work")
 	if err != nil {
-		t.Fatalf("ReceiveTurn() error = %v", err)
-	}
-	if len(events) != 2 {
-		t.Fatalf("ReceiveTurn() len = %d, want 2", len(events))
-	}
-	if events[0].Type != EventTypeMessageChunk {
-		t.Fatalf("events[0].Type = %q, want %q", events[0].Type, EventTypeMessageChunk)
-	}
-	if events[0].Text != "reply:hello" {
-		t.Fatalf("events[0].Text = %q, want %q", events[0].Text, "reply:hello")
-	}
-	if !(events[1].Done || events[1].Type == EventTypeCompleted) {
-		t.Fatalf("events[1] not done/completed: %+v", events[1])
+		t.Fatalf("Query() error = %v", err)
 	}
 
-	if err := client.Send(ctx, "world"); err != nil {
-		t.Fatalf("Send() error = %v", err)
+	messages, recvErr := collectTurnMessages(t, turn, 2*time.Second)
+	if recvErr != nil {
+		t.Fatalf("collectTurnMessages() error = %v", recvErr)
 	}
-	blocks, err := client.ReceiveTurnBlocks(ctx)
-	if err != nil {
-		t.Fatalf("ReceiveTurnBlocks() error = %v", err)
+	if len(messages) != 5 {
+		t.Fatalf("len(messages) = %d, want 5", len(messages))
 	}
-	if len(blocks) != 2 {
-		t.Fatalf("ReceiveTurnBlocks() len = %d, want 2", len(blocks))
+	if _, ok := messages[0].(*AssistantMessage); !ok {
+		t.Fatalf("messages[0] = %T, want AssistantMessage", messages[0])
 	}
-	if blocks[0].Kind != BlockKindText || blocks[0].Text != "reply:world" {
-		t.Fatalf("blocks[0] = %+v, want text block reply:world", blocks[0])
+	if block := firstContentBlock(t, messages[0]); block.contentBlockType() != "thinking" {
+		t.Fatalf("messages[0] block type = %q, want thinking", block.contentBlockType())
 	}
-	if blocks[1].Kind != BlockKindDone {
-		t.Fatalf("blocks[1].Kind = %q, want %q", blocks[1].Kind, BlockKindDone)
+	if toolUse, ok := firstContentBlock(t, messages[1]).(*ToolUseBlock); !ok || toolUse.Name != "bash" {
+		t.Fatalf("messages[1] = %#v, want ToolUseBlock bash", messages[1])
 	}
-
-	if err := client.CloseContext(ctx); err != nil {
-		t.Fatalf("CloseContext() error = %v", err)
+	if toolResult, ok := firstContentBlock(t, messages[2]).(*ToolResultBlock); !ok || toolResult.ToolUseID != "tool-1" {
+		t.Fatalf("messages[2] = %#v, want ToolResultBlock tool-1", messages[2])
+	}
+	if text, ok := firstContentBlock(t, messages[3]).(*TextBlock); !ok || text.Text != "执行完成" {
+		t.Fatalf("messages[3] = %#v, want text block 执行完成", messages[3])
+	}
+	if result, ok := messages[4].(*ResultMessage); !ok || result.IsError {
+		t.Fatalf("messages[4] = %#v, want successful ResultMessage", messages[4])
 	}
 }
 
-func TestClientReceiveTurnContextCancellation(t *testing.T) {
-	client := NewClient()
+func TestClientQueryReturnsPromptErrorOnTurn(t *testing.T) {
+	cfg := mockACPConfig{
+		onPrompt: func(state *mockACPState, req jsonrpcMessage, dec *json.Decoder, enc *json.Encoder) {
+			_ = enc.Encode(jsonrpcMessage{
+				JSONRPC: jsonrpcVersion,
+				ID:      req.ID,
+				Error: &jsonrpcError{
+					Code:    -32001,
+					Message: "prompt rejected",
+				},
+			})
+		},
+	}
+	client := newTestClient(t, cfg)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	events, err := client.ReceiveTurn(ctx)
-	if err == nil {
-		t.Fatal("ReceiveTurn() error = nil, want non-nil")
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
 	}
-	if len(events) != 0 {
-		t.Fatalf("ReceiveTurn() events len = %d, want 0", len(events))
+	turn, err := client.Query(ctx, "hello")
+	if err != nil {
+		t.Fatalf("Query() error = %v", err)
 	}
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("ReceiveTurn() error = %v, want context.DeadlineExceeded", err)
+
+	messages, recvErr := collectTurnMessages(t, turn, 2*time.Second)
+	if len(messages) != 0 {
+		t.Fatalf("len(messages) = %d, want 0", len(messages))
+	}
+	if recvErr == nil {
+		t.Fatal("turn error = nil, want non-nil")
+	}
+	var pErr *ProtocolError
+	if !errors.As(recvErr, &pErr) {
+		t.Fatalf("turn error = %T, want ProtocolError", recvErr)
 	}
 }
 
-func TestClientReceiveTurnReturnsEventError(t *testing.T) {
-	client := NewClient(WithEventBuffer(1))
+func TestClientQueryReturnsBeforePromptResult(t *testing.T) {
+	cfg := mockACPConfig{
+		onPrompt: func(state *mockACPState, req jsonrpcMessage, dec *json.Decoder, enc *json.Encoder) {
+			state.turn++
+			turnID := fmt.Sprintf("t-%d", state.turn)
+			for i := 0; i < defaultEventBuffer+2; i++ {
+				_ = enc.Encode(jsonrpcMessage{
+					JSONRPC: jsonrpcVersion,
+					Method:  methodSessionUpdate,
+					Params: mustRawJSON(t, sessionUpdateParams{
+						SessionID: "s-1",
+						Type:      string(eventTypeMessageChunk),
+						TurnID:    turnID,
+						Text:      fmt.Sprintf("chunk-%03d", i),
+					}),
+				})
+			}
+			_ = enc.Encode(jsonrpcMessage{
+				JSONRPC: jsonrpcVersion,
+				ID:      req.ID,
+				Result: mustRawJSON(t, sessionPromptResult{
+					Accepted:   true,
+					TurnID:     turnID,
+					StopReason: "end_turn",
+				}),
+			})
+		},
+	}
+	client := NewClient(
+		WithRunner(&testRunner{
+			startFn: func(ctx context.Context, binary string, args []string, env []string, cwd string) (*processHandle, error) {
+				return newMockACPProcess(t, cfg), nil
+			},
+		}),
+		WithBinaryPath("/tmp/mock-gemini"),
+		WithRequestTimeout(time.Second),
+		WithCloseTimeout(2*time.Second),
+		WithEventBuffer(1),
+	)
 
-	client.eventsCh <- SessionEvent{
-		Type:  EventTypeError,
-		Error: "turn failed",
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	start := time.Now()
+	turn, err := client.Query(ctx, "hello")
+	if err != nil {
+		t.Fatalf("Query() error = %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Fatalf("Query() blocked for %s, want quick submit return", elapsed)
 	}
 
-	events, err := client.ReceiveTurn(context.Background())
+	messages, recvErr := collectTurnMessages(t, turn, 3*time.Second)
+	if recvErr != nil {
+		t.Fatalf("turn recv error = %v", recvErr)
+	}
+	if len(messages) != defaultEventBuffer+3 {
+		t.Fatalf("len(messages) = %d, want %d", len(messages), defaultEventBuffer+3)
+	}
+	if text, ok := firstContentBlock(t, messages[0]).(*TextBlock); !ok || text.Text != "chunk-000" {
+		t.Fatalf("messages[0] = %#v, want first text chunk", messages[0])
+	}
+	if result, ok := messages[len(messages)-1].(*ResultMessage); !ok || result.StopReason != "end_turn" {
+		t.Fatalf("last message = %#v, want ResultMessage stopReason=end_turn", messages[len(messages)-1])
+	}
+}
+
+func TestClientQueryRejectsConcurrentTurns(t *testing.T) {
+	release := make(chan struct{})
+	cfg := mockACPConfig{
+		onPrompt: func(state *mockACPState, req jsonrpcMessage, dec *json.Decoder, enc *json.Encoder) {
+			<-release
+			state.turn++
+			_ = enc.Encode(jsonrpcMessage{
+				JSONRPC: jsonrpcVersion,
+				ID:      req.ID,
+				Result:  mustRawJSON(t, sessionPromptResult{Accepted: true, TurnID: fmt.Sprintf("t-%d", state.turn), StopReason: "end_turn"}),
+			})
+		},
+	}
+	client := newTestClient(t, cfg)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	turn, err := client.Query(ctx, "hello")
+	if err != nil {
+		t.Fatalf("first Query() error = %v", err)
+	}
+	_, err = client.Query(ctx, "world")
 	if err == nil {
-		t.Fatal("ReceiveTurn() error = nil, want non-nil")
-	}
-	if len(events) != 1 {
-		t.Fatalf("ReceiveTurn() events len = %d, want 1", len(events))
+		t.Fatal("second Query() error = nil, want non-nil")
 	}
 	var pErr *ProtocolError
 	if !errors.As(err, &pErr) {
-		t.Fatalf("ReceiveTurn() error = %T, want ProtocolError", err)
+		t.Fatalf("second Query() error = %T, want ProtocolError", err)
 	}
-	if pErr.Message != "turn failed" {
-		t.Fatalf("ProtocolError.Message = %q, want %q", pErr.Message, "turn failed")
-	}
-}
-
-func TestClientSendAndReceive(t *testing.T) {
-	runner := &testRunner{
-		startFn: func(ctx context.Context, binary string, args []string, env []string, cwd string) (*processHandle, error) {
-			return newMockACPProcess(t, mockACPConfig{}), nil
-		},
-	}
-
-	client := NewClient(
-		WithRunner(runner),
-		WithBinaryPath("/tmp/mock-gemini"),
-		WithRequestTimeout(time.Second),
-		WithCloseTimeout(2*time.Second),
-	)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := client.Connect(ctx); err != nil {
-		t.Fatalf("Connect() error = %v", err)
-	}
-
-	blocks, err := client.SendAndReceive(ctx, "one-shot")
-	if err != nil {
-		t.Fatalf("SendAndReceive() error = %v", err)
-	}
-	if len(blocks) != 2 {
-		t.Fatalf("SendAndReceive() len = %d, want 2", len(blocks))
-	}
-	if blocks[0].Kind != BlockKindText || blocks[0].Text != "reply:one-shot" {
-		t.Fatalf("blocks[0] = %+v, want text block reply:one-shot", blocks[0])
-	}
-	if blocks[1].Kind != BlockKindDone {
-		t.Fatalf("blocks[1].Kind = %q, want %q", blocks[1].Kind, BlockKindDone)
-	}
-
-	if err := client.CloseContext(ctx); err != nil {
-		t.Fatalf("CloseContext() error = %v", err)
+	close(release)
+	if _, recvErr := collectTurnMessages(t, turn, 2*time.Second); recvErr != nil {
+		t.Fatalf("first turn recv error = %v", recvErr)
 	}
 }
 
-func TestClientEmitEventBackpressure(t *testing.T) {
-	client := NewClient(WithEventBuffer(1))
-
-	client.eventsCh <- SessionEvent{
-		Type: EventTypeMessageChunk,
-		Text: "first",
-	}
-
-	blockedDone := make(chan struct{})
-	go func() {
-		defer close(blockedDone)
-		client.emitEvent(SessionEvent{
-			Type: EventTypeCompleted,
-			Done: true,
-		})
-	}()
-
-	select {
-	case <-blockedDone:
-		t.Fatal("emitEvent should block when events channel is full")
-	case <-time.After(100 * time.Millisecond):
-	}
-
-	select {
-	case ev := <-client.eventsCh:
-		if ev.Text != "first" {
-			t.Fatalf("first event text = %q, want first", ev.Text)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timeout waiting first event")
-	}
-
-	select {
-	case <-blockedDone:
-	case <-time.After(time.Second):
-		t.Fatal("emitEvent did not unblock after draining events channel")
-	}
-
-	select {
-	case ev := <-client.eventsCh:
-		if ev.Type != EventTypeCompleted || !ev.Done {
-			t.Fatalf("second event = %+v, want completed done=true", ev)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timeout waiting second event")
-	}
-}
-
-func TestClientReceiveBlocksWithErrorsNoDropOnBackpressure(t *testing.T) {
-	client := NewClient(WithEventBuffer(1))
-	blocks, errs := client.ReceiveBlocksWithErrors()
-
-	client.eventsCh <- SessionEvent{
-		Type: EventTypeMessageChunk,
-		Text: "first",
-	}
-	client.eventsCh <- SessionEvent{
-		Type: EventTypeCompleted,
-		Done: true,
-	}
-	close(client.eventsCh)
-
-	select {
-	case err := <-errs:
-		if err != nil {
-			t.Fatalf("unexpected receive error: %v", err)
-		}
-	case <-time.After(120 * time.Millisecond):
-	}
-
-	select {
-	case block := <-blocks:
-		if block.Kind != BlockKindText || block.Text != "first" {
-			t.Fatalf("block[0] = %+v, want text block", block)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timeout waiting first block")
-	}
-
-	select {
-	case block := <-blocks:
-		if block.Kind != BlockKindDone || !block.Done {
-			t.Fatalf("block[1] = %+v, want done block", block)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timeout waiting second block")
-	}
-
-	select {
-	case _, ok := <-blocks:
-		if ok {
-			t.Fatal("blocks channel still open, want closed")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timeout waiting blocks channel close")
-	}
-}
-
-func TestClientSendReturnsConnectionInactiveError(t *testing.T) {
+func TestClientQueryReturnsConnectionInactiveError(t *testing.T) {
 	client := NewClient()
 	rpcConn := &conn{done: make(chan struct{})}
 	close(rpcConn.done)
@@ -525,8 +322,8 @@ func TestClientSendReturnsConnectionInactiveError(t *testing.T) {
 	}
 	client.mu.Unlock()
 
-	err := client.Send(context.Background(), "hello")
-	assertConnectionInactiveError(t, err, "send", 17, "panic: boom")
+	_, err := client.Query(context.Background(), "hello")
+	assertConnectionInactiveError(t, err, "query", 17, "panic: boom")
 }
 
 func TestClientInterruptReturnsConnectionInactiveError(t *testing.T) {
@@ -637,45 +434,41 @@ func runPermissionRoundtrip(t *testing.T, permissionParams string, extraOpts ...
 
 	permResultCh := make(chan requestPermissionResult, 1)
 
-	runner := &testRunner{
-		startFn: func(ctx context.Context, binary string, args []string, env []string, cwd string) (*processHandle, error) {
-			cfg := mockACPConfig{
-				onPrompt: func(state *mockACPState, req jsonrpcMessage, dec *json.Decoder, enc *json.Encoder) {
-					_ = enc.Encode(jsonrpcMessage{
-						JSONRPC: jsonrpcVersion,
-						ID:      json.RawMessage("99"),
-						Method:  methodSessionRequestPermission,
-						Params:  json.RawMessage(permissionParams),
-					})
+	cfg := mockACPConfig{
+		onPrompt: func(state *mockACPState, req jsonrpcMessage, dec *json.Decoder, enc *json.Encoder) {
+			_ = enc.Encode(jsonrpcMessage{
+				JSONRPC: jsonrpcVersion,
+				ID:      json.RawMessage("99"),
+				Method:  methodSessionRequestPermission,
+				Params:  json.RawMessage(permissionParams),
+			})
 
-					var permResp jsonrpcMessage
-					if err := dec.Decode(&permResp); err == nil {
-						var out requestPermissionResult
-						if permResp.Error == nil {
-							_ = json.Unmarshal(permResp.Result, &out)
-							permResultCh <- out
-						}
-					}
-
-					state.turn++
-					_ = enc.Encode(jsonrpcMessage{
-						JSONRPC: jsonrpcVersion,
-						ID:      req.ID,
-						Result:  mustRawJSON(t, sessionPromptResult{Accepted: true, TurnID: fmt.Sprintf("t-%d", state.turn)}),
-					})
-					_ = enc.Encode(jsonrpcMessage{
-						JSONRPC: jsonrpcVersion,
-						Method:  methodSessionUpdate,
-						Params:  mustRawJSON(t, sessionUpdateParams{SessionID: "s-1", Type: string(EventTypeCompleted), TurnID: fmt.Sprintf("t-%d", state.turn), Done: true}),
-					})
-				},
+			var permResp jsonrpcMessage
+			if err := dec.Decode(&permResp); err == nil && permResp.Error == nil {
+				var out requestPermissionResult
+				_ = json.Unmarshal(permResp.Result, &out)
+				permResultCh <- out
 			}
-			return newMockACPProcess(t, cfg), nil
+
+			state.turn++
+			_ = enc.Encode(jsonrpcMessage{
+				JSONRPC: jsonrpcVersion,
+				ID:      req.ID,
+				Result: mustRawJSON(t, sessionPromptResult{
+					Accepted:   true,
+					TurnID:     fmt.Sprintf("t-%d", state.turn),
+					StopReason: "end_turn",
+				}),
+			})
 		},
 	}
 
 	clientOpts := []Option{
-		WithRunner(runner),
+		WithRunner(&testRunner{
+			startFn: func(ctx context.Context, binary string, args []string, env []string, cwd string) (*processHandle, error) {
+				return newMockACPProcess(t, cfg), nil
+			},
+		}),
 		WithBinaryPath("/tmp/mock-gemini"),
 		WithRequestTimeout(time.Second),
 		WithCloseTimeout(2 * time.Second),
@@ -690,11 +483,13 @@ func runPermissionRoundtrip(t *testing.T, permissionParams string, extraOpts ...
 		t.Fatalf("Connect() error = %v", err)
 	}
 
-	events, errs := client.ReceiveWithErrors()
-	if err := client.Send(ctx, "need-permission"); err != nil {
-		t.Fatalf("Send() error = %v", err)
+	turn, err := client.Query(ctx, "need-permission")
+	if err != nil {
+		t.Fatalf("Query() error = %v", err)
 	}
-	_ = waitTurnEvents(t, events, errs, 2*time.Second)
+	if _, recvErr := collectTurnMessages(t, turn, 2*time.Second); recvErr != nil {
+		t.Fatalf("turn recv error = %v", recvErr)
+	}
 
 	var out requestPermissionResult
 	select {
@@ -707,6 +502,83 @@ func runPermissionRoundtrip(t *testing.T, permissionParams string, extraOpts ...
 		t.Fatalf("CloseContext() error = %v", err)
 	}
 	return out
+}
+
+func newTestClient(t *testing.T, cfg mockACPConfig) *Client {
+	t.Helper()
+	return NewClient(
+		WithRunner(&testRunner{
+			startFn: func(ctx context.Context, binary string, args []string, env []string, cwd string) (*processHandle, error) {
+				return newMockACPProcess(t, cfg), nil
+			},
+		}),
+		WithBinaryPath("/tmp/mock-gemini"),
+		WithRequestTimeout(time.Second),
+		WithCloseTimeout(2*time.Second),
+	)
+}
+
+func assertTurnText(t *testing.T, messages []Message, want string) {
+	t.Helper()
+	if len(messages) != 2 {
+		t.Fatalf("len(messages) = %d, want 2", len(messages))
+	}
+	assistant, ok := messages[0].(*AssistantMessage)
+	if !ok {
+		t.Fatalf("messages[0] = %T, want AssistantMessage", messages[0])
+	}
+	text, ok := firstContentBlock(t, assistant).(*TextBlock)
+	if !ok || text.Text != want {
+		t.Fatalf("messages[0] text = %#v, want %q", messages[0], want)
+	}
+	result, ok := messages[1].(*ResultMessage)
+	if !ok || result.IsError {
+		t.Fatalf("messages[1] = %#v, want successful ResultMessage", messages[1])
+	}
+}
+
+func firstContentBlock(t *testing.T, msg Message) ContentBlock {
+	t.Helper()
+	assistant, ok := msg.(*AssistantMessage)
+	if !ok {
+		t.Fatalf("msg = %T, want AssistantMessage", msg)
+	}
+	if len(assistant.Content) != 1 {
+		t.Fatalf("len(Content) = %d, want 1", len(assistant.Content))
+	}
+	return assistant.Content[0]
+}
+
+func collectTurnMessages(t *testing.T, turn *TurnHandle, timeout time.Duration) ([]Message, error) {
+	t.Helper()
+
+	deadline := time.After(timeout)
+	messages := turn.Messages()
+	errs := turn.Errors()
+	var out []Message
+
+	for messages != nil || errs != nil {
+		select {
+		case err, ok := <-errs:
+			if !ok {
+				errs = nil
+				continue
+			}
+			if err != nil {
+				return out, err
+			}
+		case msg, ok := <-messages:
+			if !ok {
+				messages = nil
+				continue
+			}
+			out = append(out, msg)
+		case <-deadline:
+			t.Fatalf("timeout collecting turn messages, collected=%d", len(out))
+		}
+	}
+
+	return out, nil
 }
 
 func assertConnectionInactiveError(t *testing.T, err error, op string, exitCode int, stderrTail string) {
@@ -738,62 +610,6 @@ func assertConnectionInactiveError(t *testing.T, err error, op string, exitCode 
 	}
 	if processErr.StderrTail != stderrTail {
 		t.Fatalf("processErr.StderrTail = %q, want %q", processErr.StderrTail, stderrTail)
-	}
-}
-
-func waitTurnEvents(t *testing.T, events <-chan SessionEvent, errs <-chan error, timeout time.Duration) []SessionEvent {
-	t.Helper()
-	deadline := time.After(timeout)
-	var out []SessionEvent
-
-	for {
-		select {
-		case err, ok := <-errs:
-			if !ok {
-				err = nil
-			}
-			if err != nil {
-				t.Fatalf("receive error: %v", err)
-			}
-		case ev, ok := <-events:
-			if !ok {
-				return out
-			}
-			out = append(out, ev)
-			if ev.Done || ev.Type == EventTypeCompleted {
-				return out
-			}
-		case <-deadline:
-			t.Fatalf("timeout waiting events, collected=%d", len(out))
-		}
-	}
-}
-
-func waitTurnBlocks(t *testing.T, blocks <-chan StreamBlock, errs <-chan error, timeout time.Duration) []StreamBlock {
-	t.Helper()
-	deadline := time.After(timeout)
-	var out []StreamBlock
-
-	for {
-		select {
-		case err, ok := <-errs:
-			if !ok {
-				err = nil
-			}
-			if err != nil {
-				t.Fatalf("receive error: %v", err)
-			}
-		case block, ok := <-blocks:
-			if !ok {
-				return out
-			}
-			out = append(out, block)
-			if block.Done || block.Kind == BlockKindDone || block.Kind == BlockKindError {
-				return out
-			}
-		case <-deadline:
-			t.Fatalf("timeout waiting blocks, collected=%d", len(out))
-		}
 	}
 }
 
@@ -873,15 +689,10 @@ func newMockACPProcess(t *testing.T, cfg mockACPConfig) *processHandle {
 				turnID := fmt.Sprintf("t-%d", state.turn)
 				_ = enc.Encode(jsonrpcMessage{
 					JSONRPC: jsonrpcVersion,
-					ID:      msg.ID,
-					Result:  mustRawJSON(t, sessionPromptResult{Accepted: true, TurnID: turnID}),
-				})
-				_ = enc.Encode(jsonrpcMessage{
-					JSONRPC: jsonrpcVersion,
 					Method:  methodSessionUpdate,
 					Params: mustRawJSON(t, sessionUpdateParams{
 						SessionID: "s-1",
-						Type:      string(EventTypeMessageChunk),
+						Type:      string(eventTypeMessageChunk),
 						TurnID:    turnID,
 						Text:      "reply:" + promptText,
 					}),
@@ -891,10 +702,15 @@ func newMockACPProcess(t *testing.T, cfg mockACPConfig) *processHandle {
 					Method:  methodSessionUpdate,
 					Params: mustRawJSON(t, sessionUpdateParams{
 						SessionID: "s-1",
-						Type:      string(EventTypeCompleted),
+						Type:      string(eventTypeCompleted),
 						TurnID:    turnID,
 						Done:      true,
 					}),
+				})
+				_ = enc.Encode(jsonrpcMessage{
+					JSONRPC: jsonrpcVersion,
+					ID:      msg.ID,
+					Result:  mustRawJSON(t, sessionPromptResult{Accepted: true, TurnID: turnID}),
 				})
 			case methodSessionInterrupt:
 				// Best-effort; no response for notifications.

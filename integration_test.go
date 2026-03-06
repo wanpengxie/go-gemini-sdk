@@ -17,6 +17,37 @@ import (
 
 const integrationEnv = "GEMINI_SDK_INTEGRATION"
 
+func collectQueryText(ctx context.Context, messages <-chan Message, errs <-chan error) (string, error) {
+	var out strings.Builder
+	for messages != nil || errs != nil {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case err, ok := <-errs:
+			if !ok {
+				errs = nil
+				continue
+			}
+			if err != nil {
+				return "", err
+			}
+		case msg, ok := <-messages:
+			if !ok {
+				messages = nil
+				continue
+			}
+			if assistant, ok := msg.(*AssistantMessage); ok {
+				for _, block := range assistant.Content {
+					if text, ok := block.(*TextBlock); ok {
+						out.WriteString(text.Text)
+					}
+				}
+			}
+		}
+	}
+	return out.String(), nil
+}
+
 func TestIntegrationQuery(t *testing.T) {
 	requireIntegrationEnv(t)
 
@@ -31,7 +62,7 @@ func TestIntegrationQuery(t *testing.T) {
 	}
 }
 
-func TestIntegrationClientSendReceiveMessages(t *testing.T) {
+func TestIntegrationClientQueryReceiveResponse(t *testing.T) {
 	requireIntegrationEnv(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 240*time.Second)
@@ -65,7 +96,7 @@ func TestIntegrationOptionsAffectCLIInvocation(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 240*time.Second)
 	defer cancel()
-	out, err := Query(ctx, "请只回复 OK", []Option{
+	out, err := collectQueryText(ctx, Query(ctx, "请只回复 OK", []Option{
 		WithBinaryPath(wrapper.scriptPath),
 		WithEnv(
 			"GO_GEMINI_WRAPPER_LOG="+wrapper.logPrefix,
@@ -78,7 +109,7 @@ func TestIntegrationOptionsAffectCLIInvocation(t *testing.T) {
 		WithAllowedTools([]string{"read_file"}),
 		WithAddDirs(includeA, includeB),
 		WithPolicyPaths(policyFile),
-	}...)
+	}...))
 	if err != nil {
 		t.Fatalf("query with options failed: %v", err)
 	}
@@ -116,14 +147,14 @@ func TestIntegrationExcludedToolsAreConvertedToPolicy(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 240*time.Second)
 	defer cancel()
-	out, err := Query(ctx, "请只回复 OK", []Option{
+	out, err := collectQueryText(ctx, Query(ctx, "请只回复 OK", []Option{
 		WithBinaryPath(wrapper.scriptPath),
 		WithEnv(
 			"GO_GEMINI_WRAPPER_LOG="+wrapper.logPrefix,
 			"GO_GEMINI_WRAPPER_TARGET="+bin,
 		),
 		WithExcludedTools([]string{"run_shell_command", "write_file"}),
-	}...)
+	}...))
 	if err != nil {
 		t.Fatalf("query with excluded tools failed: %v", err)
 	}

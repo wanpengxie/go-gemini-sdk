@@ -25,8 +25,6 @@ func main() {
 	defer func() {
 		_ = client.Close()
 	}()
-
-	messages, errs := client.ReceiveMessagesWithErrors()
 	prompts := []string{
 		"你好，请介绍一下你自己。",
 		"把上一句压缩成 10 个字以内。",
@@ -34,34 +32,28 @@ func main() {
 	}
 
 	for _, prompt := range prompts {
-		if err := client.Send(ctx, prompt); err != nil {
-			log.Fatalf("send failed: %v", err)
+		turn, err := client.Query(ctx, prompt)
+		if err != nil {
+			log.Fatalf("query failed: %v", err)
 		}
+		messages, errs := turn.Messages(), turn.Errors()
 
 		fmt.Printf("\n>>> %s\n", prompt)
 		for {
 			select {
-			case err := <-errs:
+			case err, ok := <-errs:
+				if !ok {
+					errs = nil
+					continue
+				}
 				if err != nil {
 					log.Fatalf("receive error: %v", err)
 				}
 			case msg, ok := <-messages:
 				if !ok {
-					return
+					goto nextTurn
 				}
-				switch msg.Kind {
-				case gemini.BlockKindText, gemini.BlockKindThinking:
-					if msg.Text != "" {
-						fmt.Print(msg.Text)
-					}
-				case gemini.BlockKindToolCall:
-					fmt.Printf("\n[tool_call] name=%s id=%s\n", msg.ToolName, msg.ToolCallID)
-				case gemini.BlockKindToolResult:
-					fmt.Printf("\n[tool_result] name=%s id=%s\n", msg.ToolName, msg.ToolCallID)
-				case gemini.BlockKindError:
-					log.Fatalf("model error: %s", msg.Error)
-				}
-				if msg.Done || msg.Kind == gemini.BlockKindDone {
+				if renderTurnMessage(msg) {
 					fmt.Println()
 					goto nextTurn
 				}
@@ -69,4 +61,32 @@ func main() {
 		}
 	nextTurn:
 	}
+}
+
+func renderTurnMessage(msg gemini.Message) bool {
+	switch m := msg.(type) {
+	case *gemini.AssistantMessage:
+		for _, block := range m.Content {
+			switch b := block.(type) {
+			case *gemini.TextBlock:
+				if b.Text != "" {
+					fmt.Print(b.Text)
+				}
+			case *gemini.ThinkingBlock:
+				if b.Thinking != "" {
+					fmt.Print(b.Thinking)
+				}
+			case *gemini.ToolUseBlock:
+				fmt.Printf("\n[tool_call] name=%s id=%s\n", b.Name, b.ID)
+			case *gemini.ToolResultBlock:
+				fmt.Printf("\n[tool_result] name=%s id=%s\n", b.Name, b.ToolUseID)
+			}
+		}
+	case *gemini.ResultMessage:
+		if m.IsError {
+			log.Fatalf("model error: %s", m.Error)
+		}
+		return true
+	}
+	return false
 }

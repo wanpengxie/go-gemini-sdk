@@ -66,6 +66,13 @@ type conn struct {
 	closeOnce sync.Once
 }
 
+type pendingCall struct {
+	conn   *conn
+	method string
+	key    string
+	respCh chan jsonrpcMessage
+}
+
 func newConn(stream io.ReadWriteCloser, maxEventBytes int) *conn {
 	c := &conn{
 		stream:        stream,
@@ -104,18 +111,26 @@ func (c *conn) registerHandler(method string, handler rpcHandler) {
 }
 
 func (c *conn) call(ctx context.Context, method string, params any, out any) error {
+	call, err := c.beginCall(method, params)
+	if err != nil {
+		return err
+	}
+	return call.wait(ctx, out)
+}
+
+func (c *conn) beginCall(method string, params any) (*pendingCall, error) {
 	if method == "" {
-		return wrapOp("jsonrpc.call", &ProtocolError{Method: method, Message: "empty method"})
+		return nil, wrapOp("jsonrpc.call", &ProtocolError{Method: method, Message: "empty method"})
 	}
 	select {
 	case <-c.done:
-		return wrapOp("jsonrpc.call", c.inactiveErr())
+		return nil, wrapOp("jsonrpc.call", c.inactiveErr())
 	default:
 	}
 
 	paramBytes, err := json.Marshal(params)
 	if err != nil {
-		return wrapOp("jsonrpc.call", &ProtocolError{Method: method, Message: "marshal params", Err: err})
+		return nil, wrapOp("jsonrpc.call", &ProtocolError{Method: method, Message: "marshal params", Err: err})
 	}
 
 	id := atomic.AddUint64(&c.nextID, 1)
@@ -136,29 +151,32 @@ func (c *conn) call(ctx context.Context, method string, params any, out any) err
 	c.mu.Unlock()
 
 	if err := c.writeMessage(msg); err != nil {
-		c.mu.Lock()
-		delete(c.pending, key)
-		c.mu.Unlock()
-		close(respCh)
-		return wrapOp("jsonrpc.call", err)
+		c.removePending(key)
+		return nil, wrapOp("jsonrpc.call", err)
 	}
 
+	return &pendingCall{
+		conn:   c,
+		method: method,
+		key:    key,
+		respCh: respCh,
+	}, nil
+}
+
+func (c *pendingCall) wait(ctx context.Context, out any) error {
 	select {
 	case <-ctx.Done():
-		c.mu.Lock()
-		delete(c.pending, key)
-		c.mu.Unlock()
-		close(respCh)
+		c.conn.removePending(c.key)
 		return wrapOp("jsonrpc.call", ctx.Err())
-	case <-c.done:
-		return wrapOp("jsonrpc.call", c.inactiveErr())
-	case resp, ok := <-respCh:
+	case <-c.conn.done:
+		return wrapOp("jsonrpc.call", c.conn.inactiveErr())
+	case resp, ok := <-c.respCh:
 		if !ok {
-			return wrapOp("jsonrpc.call", c.inactiveErr())
+			return wrapOp("jsonrpc.call", c.conn.inactiveErr())
 		}
 		if resp.Error != nil {
 			return wrapOp("jsonrpc.call", &ProtocolError{
-				Method:  method,
+				Method:  c.method,
 				Code:    resp.Error.Code,
 				Message: resp.Error.Message,
 				Data:    string(resp.Error.Data),
@@ -166,7 +184,7 @@ func (c *conn) call(ctx context.Context, method string, params any, out any) err
 		}
 		if out != nil && len(resp.Result) > 0 && string(resp.Result) != "null" {
 			if err := json.Unmarshal(resp.Result, out); err != nil {
-				return wrapOp("jsonrpc.call", &ProtocolError{Method: method, Message: "unmarshal result", Err: err})
+				return wrapOp("jsonrpc.call", &ProtocolError{Method: c.method, Message: "unmarshal result", Err: err})
 			}
 		}
 		return nil
@@ -270,13 +288,7 @@ func (c *conn) dispatchNotification(msg jsonrpcMessage) {
 
 func (c *conn) dispatchResponse(msg jsonrpcMessage) {
 	key := msg.idKey()
-	c.mu.Lock()
-	respCh, ok := c.pending[key]
-	if ok {
-		delete(c.pending, key)
-	}
-	c.mu.Unlock()
-
+	respCh, ok := c.removePending(key)
 	if !ok {
 		return
 	}
@@ -398,6 +410,17 @@ func (c *conn) pushErr(err error) {
 	case c.errCh <- err:
 	default:
 	}
+}
+
+func (c *conn) removePending(key string) (chan jsonrpcMessage, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	respCh, ok := c.pending[key]
+	if ok {
+		delete(c.pending, key)
+	}
+	return respCh, ok
 }
 
 func bytesTrimSpace(raw []byte) []byte {

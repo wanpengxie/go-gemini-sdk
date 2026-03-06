@@ -9,7 +9,7 @@ import (
 )
 
 func TestQuerySuccess(t *testing.T) {
-	runner := &testRunner{
+	clientRunner := &testRunner{
 		startFn: func(ctx context.Context, binary string, args []string, env []string, cwd string) (*processHandle, error) {
 			return newMockACPProcess(t, mockACPConfig{}), nil
 		},
@@ -18,17 +18,16 @@ func TestQuerySuccess(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	got, err := Query(ctx, "hello", WithRunner(runner), WithBinaryPath("/tmp/mock-gemini"))
+	messages, errs := Query(ctx, "hello", WithRunner(clientRunner), WithBinaryPath("/tmp/mock-gemini"))
+	got, err := collectQueryMessages(t, messages, errs, 3*time.Second)
 	if err != nil {
 		t.Fatalf("Query() error = %v", err)
 	}
-	if got != "reply:hello" {
-		t.Fatalf("Query() = %q, want %q", got, "reply:hello")
-	}
+	assertTurnText(t, got, "reply:hello")
 }
 
 func TestQueryReturnsPromptError(t *testing.T) {
-	runner := &testRunner{
+	clientRunner := &testRunner{
 		startFn: func(ctx context.Context, binary string, args []string, env []string, cwd string) (*processHandle, error) {
 			cfg := mockACPConfig{
 				onPrompt: func(state *mockACPState, req jsonrpcMessage, dec *json.Decoder, enc *json.Encoder) {
@@ -49,7 +48,11 @@ func TestQueryReturnsPromptError(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	_, err := Query(ctx, "hello", WithRunner(runner), WithBinaryPath("/tmp/mock-gemini"))
+	messages, errs := Query(ctx, "hello", WithRunner(clientRunner), WithBinaryPath("/tmp/mock-gemini"))
+	got, err := collectQueryMessages(t, messages, errs, 3*time.Second)
+	if len(got) != 0 {
+		t.Fatalf("len(messages) = %d, want 0", len(got))
+	}
 	if err == nil {
 		t.Fatal("Query() error = nil, want non-nil")
 	}
@@ -59,48 +62,37 @@ func TestQueryReturnsPromptError(t *testing.T) {
 	}
 }
 
-func TestQueryBlocksSuccess(t *testing.T) {
-	runner := &testRunner{
-		startFn: func(ctx context.Context, binary string, args []string, env []string, cwd string) (*processHandle, error) {
-			return newMockACPProcess(t, mockACPConfig{}), nil
-		},
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	blocksCh, errsCh, err := QueryBlocks(ctx, "hello", WithRunner(runner), WithBinaryPath("/tmp/mock-gemini"))
-	if err != nil {
-		t.Fatalf("QueryBlocks() error = %v", err)
-	}
-
-	blocks, recvErr := collectBlocksResult(t, blocksCh, errsCh, 3*time.Second)
-	if recvErr != nil {
-		t.Fatalf("QueryBlocks() recv error = %v", recvErr)
-	}
-	if len(blocks) != 2 {
-		t.Fatalf("QueryBlocks() len = %d, want 2", len(blocks))
-	}
-	if blocks[0].Kind != BlockKindText || blocks[0].Text != "reply:hello" {
-		t.Fatalf("blocks[0] = %+v, want text block reply:hello", blocks[0])
-	}
-	if blocks[1].Kind != BlockKindDone {
-		t.Fatalf("blocks[1].Kind = %q, want %q", blocks[1].Kind, BlockKindDone)
-	}
-}
-
-func TestQueryBlocksReturnsPromptError(t *testing.T) {
-	runner := &testRunner{
+func TestQueryStreamsTypedMessages(t *testing.T) {
+	clientRunner := &testRunner{
 		startFn: func(ctx context.Context, binary string, args []string, env []string, cwd string) (*processHandle, error) {
 			cfg := mockACPConfig{
 				onPrompt: func(state *mockACPState, req jsonrpcMessage, dec *json.Decoder, enc *json.Encoder) {
+					state.turn++
+					turnID := "t-1"
+					_ = enc.Encode(jsonrpcMessage{
+						JSONRPC: jsonrpcVersion,
+						Method:  methodSessionUpdate,
+						Params: mustRawJSON(t, sessionUpdateParams{
+							SessionID: "s-1",
+							Type:      "agent_message_chunk",
+							TurnID:    turnID,
+							Text:      "hello",
+						}),
+					})
+					_ = enc.Encode(jsonrpcMessage{
+						JSONRPC: jsonrpcVersion,
+						Method:  methodSessionUpdate,
+						Params: mustRawJSON(t, sessionUpdateParams{
+							SessionID: "s-1",
+							Type:      string(eventTypeCompleted),
+							TurnID:    turnID,
+							Done:      true,
+						}),
+					})
 					_ = enc.Encode(jsonrpcMessage{
 						JSONRPC: jsonrpcVersion,
 						ID:      req.ID,
-						Error: &jsonrpcError{
-							Code:    -32001,
-							Message: "prompt rejected",
-						},
+						Result:  mustRawJSON(t, sessionPromptResult{Accepted: true, TurnID: turnID}),
 					})
 				},
 			}
@@ -111,26 +103,18 @@ func TestQueryBlocksReturnsPromptError(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	blocksCh, errsCh, err := QueryBlocks(ctx, "hello", WithRunner(runner), WithBinaryPath("/tmp/mock-gemini"))
+	messages, errs := Query(ctx, "hello", WithRunner(clientRunner), WithBinaryPath("/tmp/mock-gemini"))
+	got, err := collectQueryMessages(t, messages, errs, 3*time.Second)
 	if err != nil {
-		t.Fatalf("QueryBlocks() error = %v", err)
+		t.Fatalf("Query() error = %v", err)
 	}
-
-	blocks, recvErr := collectBlocksResult(t, blocksCh, errsCh, 3*time.Second)
-	if len(blocks) != 0 {
-		t.Fatalf("QueryBlocks() blocks len = %d, want 0", len(blocks))
-	}
-	if recvErr == nil {
-		t.Fatal("QueryBlocks() recv error = nil, want non-nil")
-	}
-	var pErr *ProtocolError
-	if !errors.As(recvErr, &pErr) {
-		t.Fatalf("QueryBlocks() recv error = %T, want ProtocolError", recvErr)
+	if len(got) != 2 {
+		t.Fatalf("len(messages) = %d, want 2", len(got))
 	}
 }
 
-func TestQueryBlocksContextCanceled(t *testing.T) {
-	runner := &testRunner{
+func TestQueryContextCanceled(t *testing.T) {
+	clientRunner := &testRunner{
 		startFn: func(ctx context.Context, binary string, args []string, env []string, cwd string) (*processHandle, error) {
 			cfg := mockACPConfig{
 				onPrompt: func(state *mockACPState, req jsonrpcMessage, dec *json.Decoder, enc *json.Encoder) {
@@ -142,28 +126,28 @@ func TestQueryBlocksContextCanceled(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	blocksCh, errsCh, err := QueryBlocks(ctx, "hello", WithRunner(runner), WithBinaryPath("/tmp/mock-gemini"))
-	if err != nil {
-		t.Fatalf("QueryBlocks() error = %v", err)
-	}
+	messages, errs := Query(ctx, "hello", WithRunner(clientRunner), WithBinaryPath("/tmp/mock-gemini"))
 	cancel()
 
-	_, recvErr := collectBlocksResult(t, blocksCh, errsCh, 3*time.Second)
-	if recvErr == nil {
-		t.Fatal("QueryBlocks() recv error = nil, want non-nil")
+	got, err := collectQueryMessages(t, messages, errs, 3*time.Second)
+	if len(got) != 0 {
+		t.Fatalf("len(messages) = %d, want 0", len(got))
 	}
-	if !errors.Is(recvErr, context.Canceled) {
-		t.Fatalf("QueryBlocks() recv error = %v, want context.Canceled", recvErr)
+	if err == nil {
+		t.Fatal("Query() error = nil, want non-nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Query() error = %v, want context.Canceled", err)
 	}
 }
 
-func collectBlocksResult(t *testing.T, blocks <-chan StreamBlock, errs <-chan error, timeout time.Duration) ([]StreamBlock, error) {
+func collectQueryMessages(t *testing.T, messages <-chan Message, errs <-chan error, timeout time.Duration) ([]Message, error) {
 	t.Helper()
 
 	deadline := time.After(timeout)
-	var out []StreamBlock
+	var out []Message
 
-	for blocks != nil || errs != nil {
+	for messages != nil || errs != nil {
 		select {
 		case err, ok := <-errs:
 			if !ok {
@@ -173,16 +157,24 @@ func collectBlocksResult(t *testing.T, blocks <-chan StreamBlock, errs <-chan er
 			if err != nil {
 				return out, err
 			}
-		case block, ok := <-blocks:
+		case msg, ok := <-messages:
 			if !ok {
-				blocks = nil
+				messages = nil
 				continue
 			}
-			out = append(out, block)
+			out = append(out, msg)
 		case <-deadline:
-			t.Fatalf("timeout collecting blocks, collected=%d", len(out))
+			t.Fatalf("timeout collecting query messages, collected=%d", len(out))
 		}
 	}
 
 	return out, nil
+}
+
+func TestDecodeJSONValueFallback(t *testing.T) {
+	raw := json.RawMessage(`{"x":1}`)
+	got := decodeJSONValue(raw)
+	if _, ok := got.(map[string]any); !ok {
+		t.Fatalf("decodeJSONValue() = %T, want map[string]any", got)
+	}
 }
