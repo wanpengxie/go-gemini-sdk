@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -241,7 +242,7 @@ func (c *conn) readLoop() {
 	for {
 		var msg jsonrpcMessage
 		if err := c.dec.Decode(&msg); err != nil {
-			if errors.Is(err, io.EOF) {
+			if isBenignReadCloseError(err) {
 				c.shutdown(io.EOF)
 				return
 			}
@@ -276,6 +277,16 @@ func (c *conn) readLoop() {
 			c.pushErr(&ProtocolError{Message: "invalid jsonrpc message"})
 		}
 	}
+}
+
+func isBenignReadCloseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, os.ErrClosed) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "file already closed")
 }
 
 func (c *conn) dispatchNotification(msg jsonrpcMessage) {

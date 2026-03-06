@@ -560,7 +560,7 @@ func (c *Client) waitProcess() {
 		c.routeTurnError(processErr)
 	}
 
-	if rpcConn != nil {
+	if waitErr != nil && rpcConn != nil {
 		rpcConn.close()
 	}
 

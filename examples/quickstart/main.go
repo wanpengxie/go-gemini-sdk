@@ -11,7 +11,7 @@ import (
 )
 
 func main() {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	opts := make([]gemini.Option, 0, 1)
@@ -51,6 +51,10 @@ func renderMessage(msg gemini.Message) bool {
 				fmt.Print(b.Text)
 			case *gemini.ThinkingBlock:
 				fmt.Print(b.Thinking)
+			case *gemini.ToolUseBlock:
+				fmt.Printf("\n[tool_call] %s (%s)\n", b.Name, b.ID)
+			case *gemini.ToolResultBlock:
+				fmt.Printf("\n[tool_result] %s (%s)\n", b.Name, b.ToolUseID)
 			}
 		}
 	case *gemini.ResultMessage:

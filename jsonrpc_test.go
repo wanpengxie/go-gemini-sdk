@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -278,6 +279,25 @@ func TestConnShutdownDuringWriteDoesNotDoubleClosePendingResponse(t *testing.T) 
 	}
 }
 
+func TestConnReadLoopTreatsClosedFileAsEOF(t *testing.T) {
+	stream := &closedReadStream{err: os.ErrClosed}
+	rpcConn := newConn(stream, defaultMaxEventBytes)
+
+	select {
+	case <-rpcConn.Done():
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting conn to close")
+	}
+
+	select {
+	case err, ok := <-rpcConn.Errors():
+		if ok && err != nil {
+			t.Fatalf("unexpected conn error = %v", err)
+		}
+	default:
+	}
+}
+
 type blockingWriteStream struct {
 	writeStarted chan struct{}
 	releaseWrite chan struct{}
@@ -310,5 +330,24 @@ func (s *blockingWriteStream) Close() error {
 	default:
 		close(s.releaseWrite)
 	}
+	return nil
+}
+
+type closedReadStream struct {
+	err error
+}
+
+func (s *closedReadStream) Read([]byte) (int, error) {
+	if s.err == nil {
+		return 0, io.EOF
+	}
+	return 0, s.err
+}
+
+func (s *closedReadStream) Write(p []byte) (int, error) {
+	return len(p), nil
+}
+
+func (s *closedReadStream) Close() error {
 	return nil
 }
