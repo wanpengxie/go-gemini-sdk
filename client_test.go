@@ -265,6 +265,151 @@ func TestClientReceiveMessagesAlias(t *testing.T) {
 	}
 }
 
+func TestClientReceiveTurnAndReceiveTurnBlocks(t *testing.T) {
+	runner := &testRunner{
+		startFn: func(ctx context.Context, binary string, args []string, env []string, cwd string) (*processHandle, error) {
+			return newMockACPProcess(t, mockACPConfig{}), nil
+		},
+	}
+
+	client := NewClient(
+		WithRunner(runner),
+		WithBinaryPath("/tmp/mock-gemini"),
+		WithRequestTimeout(time.Second),
+		WithCloseTimeout(2*time.Second),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	if err := client.Send(ctx, "hello"); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+	events, err := client.ReceiveTurn(ctx)
+	if err != nil {
+		t.Fatalf("ReceiveTurn() error = %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("ReceiveTurn() len = %d, want 2", len(events))
+	}
+	if events[0].Type != EventTypeMessageChunk {
+		t.Fatalf("events[0].Type = %q, want %q", events[0].Type, EventTypeMessageChunk)
+	}
+	if events[0].Text != "reply:hello" {
+		t.Fatalf("events[0].Text = %q, want %q", events[0].Text, "reply:hello")
+	}
+	if !(events[1].Done || events[1].Type == EventTypeCompleted) {
+		t.Fatalf("events[1] not done/completed: %+v", events[1])
+	}
+
+	if err := client.Send(ctx, "world"); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+	blocks, err := client.ReceiveTurnBlocks(ctx)
+	if err != nil {
+		t.Fatalf("ReceiveTurnBlocks() error = %v", err)
+	}
+	if len(blocks) != 2 {
+		t.Fatalf("ReceiveTurnBlocks() len = %d, want 2", len(blocks))
+	}
+	if blocks[0].Kind != BlockKindText || blocks[0].Text != "reply:world" {
+		t.Fatalf("blocks[0] = %+v, want text block reply:world", blocks[0])
+	}
+	if blocks[1].Kind != BlockKindDone {
+		t.Fatalf("blocks[1].Kind = %q, want %q", blocks[1].Kind, BlockKindDone)
+	}
+
+	if err := client.CloseContext(ctx); err != nil {
+		t.Fatalf("CloseContext() error = %v", err)
+	}
+}
+
+func TestClientReceiveTurnContextCancellation(t *testing.T) {
+	client := NewClient()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	events, err := client.ReceiveTurn(ctx)
+	if err == nil {
+		t.Fatal("ReceiveTurn() error = nil, want non-nil")
+	}
+	if len(events) != 0 {
+		t.Fatalf("ReceiveTurn() events len = %d, want 0", len(events))
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ReceiveTurn() error = %v, want context.DeadlineExceeded", err)
+	}
+}
+
+func TestClientReceiveTurnReturnsEventError(t *testing.T) {
+	client := NewClient(WithEventBuffer(1))
+
+	client.eventsCh <- SessionEvent{
+		Type:  EventTypeError,
+		Error: "turn failed",
+	}
+
+	events, err := client.ReceiveTurn(context.Background())
+	if err == nil {
+		t.Fatal("ReceiveTurn() error = nil, want non-nil")
+	}
+	if len(events) != 1 {
+		t.Fatalf("ReceiveTurn() events len = %d, want 1", len(events))
+	}
+	var pErr *ProtocolError
+	if !errors.As(err, &pErr) {
+		t.Fatalf("ReceiveTurn() error = %T, want ProtocolError", err)
+	}
+	if pErr.Message != "turn failed" {
+		t.Fatalf("ProtocolError.Message = %q, want %q", pErr.Message, "turn failed")
+	}
+}
+
+func TestClientSendAndReceive(t *testing.T) {
+	runner := &testRunner{
+		startFn: func(ctx context.Context, binary string, args []string, env []string, cwd string) (*processHandle, error) {
+			return newMockACPProcess(t, mockACPConfig{}), nil
+		},
+	}
+
+	client := NewClient(
+		WithRunner(runner),
+		WithBinaryPath("/tmp/mock-gemini"),
+		WithRequestTimeout(time.Second),
+		WithCloseTimeout(2*time.Second),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	blocks, err := client.SendAndReceive(ctx, "one-shot")
+	if err != nil {
+		t.Fatalf("SendAndReceive() error = %v", err)
+	}
+	if len(blocks) != 2 {
+		t.Fatalf("SendAndReceive() len = %d, want 2", len(blocks))
+	}
+	if blocks[0].Kind != BlockKindText || blocks[0].Text != "reply:one-shot" {
+		t.Fatalf("blocks[0] = %+v, want text block reply:one-shot", blocks[0])
+	}
+	if blocks[1].Kind != BlockKindDone {
+		t.Fatalf("blocks[1].Kind = %q, want %q", blocks[1].Kind, BlockKindDone)
+	}
+
+	if err := client.CloseContext(ctx); err != nil {
+		t.Fatalf("CloseContext() error = %v", err)
+	}
+}
+
 func TestClientEmitEventBackpressure(t *testing.T) {
 	client := NewClient(WithEventBuffer(1))
 
