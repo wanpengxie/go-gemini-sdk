@@ -41,6 +41,9 @@ type Client struct {
 
 	pumpWG sync.WaitGroup
 
+	stopCh   chan struct{}
+	stopOnce sync.Once
+
 	closeOutputOnce sync.Once
 }
 
@@ -58,6 +61,7 @@ func NewClient(opts ...Option) *Client {
 		eventsCh:    make(chan SessionEvent, applied.eventBuffer),
 		errsCh:      make(chan error, 16),
 		processDone: nil,
+		stopCh:      make(chan struct{}),
 	}
 }
 
@@ -157,7 +161,7 @@ func (c *Client) Send(ctx context.Context, prompt string) error {
 
 	rpcConn, sessionID, ok := c.snapshotActiveSession()
 	if !ok {
-		return wrapOp("client.send", io.ErrClosedPipe)
+		return wrapOp("client.send", c.connectionInactiveError("send"))
 	}
 
 	requestCtx, cancel := withTimeoutIfNeeded(ctx, c.opts.requestTimeout)
@@ -171,6 +175,9 @@ func (c *Client) Send(ctx context.Context, prompt string) error {
 		},
 	}, &result)
 	if err != nil {
+		if errors.Is(err, io.ErrClosedPipe) {
+			return wrapOp("client.send", c.connectionInactiveError("send"))
+		}
 		return wrapOp("client.send", err)
 	}
 
@@ -222,16 +229,16 @@ func (c *Client) ReceiveBlocks() <-chan StreamBlock {
 func (c *Client) ReceiveBlocksWithErrors() (<-chan StreamBlock, <-chan error) {
 	events, errs := c.ReceiveWithErrors()
 	blocks := make(chan StreamBlock, c.opts.eventBuffer)
+	stopCh := c.stopCh
 
 	go func() {
 		defer close(blocks)
 		for ev := range events {
 			block := ev.ToBlock()
 			select {
-			case blocks <- block:
-			default:
-				c.emitReceiveError(&ProtocolError{Method: methodSessionUpdate, Message: "block buffer full"})
+			case <-stopCh:
 				return
+			case blocks <- block:
 			}
 		}
 	}()
@@ -252,7 +259,7 @@ func (c *Client) ReceiveMessagesWithErrors() (<-chan StreamBlock, <-chan error) 
 func (c *Client) Interrupt(ctx context.Context) error {
 	rpcConn, sessionID, ok := c.snapshotActiveSession()
 	if !ok {
-		return nil
+		return wrapOp("client.interrupt", c.connectionInactiveError("interrupt"))
 	}
 
 	requestCtx, cancel := withTimeoutIfNeeded(ctx, c.opts.requestTimeout)
@@ -263,7 +270,7 @@ func (c *Client) Interrupt(ctx context.Context) error {
 	})
 	if err != nil {
 		if errors.Is(err, io.ErrClosedPipe) {
-			return nil
+			return wrapOp("client.interrupt", c.connectionInactiveError("interrupt"))
 		}
 		return wrapOp("client.interrupt", err)
 	}
@@ -288,6 +295,7 @@ func (c *Client) CloseContext(ctx context.Context) error {
 	if !c.connected {
 		c.closed = true
 		c.mu.Unlock()
+		c.signalStopped()
 		c.closeOutputOnce.Do(func() {
 			close(c.eventsCh)
 			close(c.errsCh)
@@ -302,6 +310,7 @@ func (c *Client) CloseContext(ctx context.Context) error {
 	processDone := c.processDone
 	closeTimeout := c.opts.closeTimeout
 	c.mu.Unlock()
+	c.signalStopped()
 
 	closeCtx, cancel := withTimeoutIfNeeded(ctx, closeTimeout)
 	defer cancel()
@@ -346,7 +355,7 @@ func (c *Client) CloseContext(ctx context.Context) error {
 	}
 
 	if err := c.getProcessErr(); err != nil {
-		return wrapOp("client.close", wrapProcessError("wait", err, c.stderrTail()))
+		return wrapOp("client.close", err)
 	}
 
 	return nil
@@ -623,14 +632,16 @@ func (c *Client) waitProcess() {
 		<-stderrDone
 	}
 
-	c.setProcessErr(waitErr)
+	processErr := wrapProcessError("wait", waitErr, c.stderrTail())
+	c.setProcessErr(processErr)
 	if processDone != nil {
 		close(processDone)
 	}
 
 	if waitErr != nil && !c.isClosing() {
-		c.emitReceiveError(wrapProcessError("wait", waitErr, c.stderrTail()))
+		c.emitReceiveError(processErr)
 	}
+	c.signalStopped()
 
 	if rpcConn != nil {
 		rpcConn.close()
@@ -661,9 +672,9 @@ func (c *Client) emitEvent(event SessionEvent) {
 		_ = recover()
 	}()
 	select {
+	case <-c.stopCh:
+		return
 	case c.eventsCh <- event:
-	default:
-		c.emitReceiveError(&ProtocolError{Method: methodSessionUpdate, Message: "event buffer full"})
 	}
 }
 
@@ -751,6 +762,23 @@ func (c *Client) cleanupLaunchArtifacts() {
 
 	if cleanup != nil {
 		cleanup()
+	}
+}
+
+func (c *Client) signalStopped() {
+	c.stopOnce.Do(func() {
+		close(c.stopCh)
+	})
+}
+
+func (c *Client) connectionInactiveError(op string) error {
+	cause := c.getProcessErr()
+	if cause == nil {
+		cause = io.ErrClosedPipe
+	}
+	return &ConnectionInactiveError{
+		Op:    op,
+		Cause: cause,
 	}
 }
 

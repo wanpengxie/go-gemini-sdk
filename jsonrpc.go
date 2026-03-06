@@ -52,6 +52,9 @@ type conn struct {
 	pending  map[string]chan jsonrpcMessage
 	handlers map[string]rpcHandler
 
+	closeErrMu sync.RWMutex
+	closeErr   error
+
 	nextID uint64
 
 	maxEventBytes int
@@ -106,7 +109,7 @@ func (c *conn) call(ctx context.Context, method string, params any, out any) err
 	}
 	select {
 	case <-c.done:
-		return wrapOp("jsonrpc.call", io.ErrClosedPipe)
+		return wrapOp("jsonrpc.call", c.inactiveErr())
 	default:
 	}
 
@@ -148,10 +151,10 @@ func (c *conn) call(ctx context.Context, method string, params any, out any) err
 		close(respCh)
 		return wrapOp("jsonrpc.call", ctx.Err())
 	case <-c.done:
-		return wrapOp("jsonrpc.call", io.ErrClosedPipe)
+		return wrapOp("jsonrpc.call", c.inactiveErr())
 	case resp, ok := <-respCh:
 		if !ok {
-			return wrapOp("jsonrpc.call", io.ErrClosedPipe)
+			return wrapOp("jsonrpc.call", c.inactiveErr())
 		}
 		if resp.Error != nil {
 			return wrapOp("jsonrpc.call", &ProtocolError{
@@ -176,7 +179,7 @@ func (c *conn) notify(ctx context.Context, method string, params any) error {
 	}
 	select {
 	case <-c.done:
-		return wrapOp("jsonrpc.notify", io.ErrClosedPipe)
+		return wrapOp("jsonrpc.notify", c.inactiveErr())
 	default:
 	}
 
@@ -262,11 +265,6 @@ func (c *conn) dispatchNotification(msg jsonrpcMessage) {
 	case <-c.done:
 		return
 	case c.notifyCh <- msg:
-	default:
-		c.pushErr(&ProtocolError{
-			Method:  msg.Method,
-			Message: "notification buffer full",
-		})
 	}
 }
 
@@ -347,6 +345,8 @@ func (c *conn) close() {
 
 func (c *conn) shutdown(cause error) {
 	c.closeOnce.Do(func() {
+		c.setCloseErr(cause)
+
 		if cause != nil && !errors.Is(cause, io.EOF) {
 			c.pushErr(cause)
 		}
@@ -357,15 +357,6 @@ func (c *conn) shutdown(cause error) {
 		c.mu.Unlock()
 
 		for _, ch := range pending {
-			select {
-			case ch <- jsonrpcMessage{
-				Error: &jsonrpcError{
-					Code:    -32001,
-					Message: "connection closed",
-				},
-			}:
-			default:
-			}
 			close(ch)
 		}
 
@@ -374,6 +365,26 @@ func (c *conn) shutdown(cause error) {
 		close(c.notifyCh)
 		close(c.errCh)
 	})
+}
+
+func (c *conn) setCloseErr(cause error) {
+	if cause == nil || errors.Is(cause, io.EOF) {
+		cause = io.ErrClosedPipe
+	}
+	c.closeErrMu.Lock()
+	if c.closeErr == nil {
+		c.closeErr = cause
+	}
+	c.closeErrMu.Unlock()
+}
+
+func (c *conn) inactiveErr() error {
+	c.closeErrMu.RLock()
+	defer c.closeErrMu.RUnlock()
+	if c.closeErr == nil {
+		return io.ErrClosedPipe
+	}
+	return c.closeErr
 }
 
 func (c *conn) pushErr(err error) {

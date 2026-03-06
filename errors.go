@@ -12,6 +12,8 @@ var (
 	ErrProcess = errors.New("gemini process error")
 	// ErrProtocol indicates protocol or JSON-RPC failures.
 	ErrProtocol = errors.New("gemini protocol error")
+	// ErrConnectionInactive indicates RPC call attempted on an inactive connection.
+	ErrConnectionInactive = errors.New("gemini connection inactive")
 )
 
 // SDKError wraps operation-level context.
@@ -136,6 +138,38 @@ func (e *ProtocolError) Unwrap() error {
 
 func (e *ProtocolError) Is(target error) bool {
 	return target == ErrProtocol
+}
+
+// ConnectionInactiveError indicates operation failed because the client
+// connection is already inactive.
+type ConnectionInactiveError struct {
+	Op    string
+	Cause error
+}
+
+func (e *ConnectionInactiveError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	msg := ErrConnectionInactive.Error()
+	if e.Op != "" {
+		msg = fmt.Sprintf("%s (%s)", msg, e.Op)
+	}
+	if e.Cause != nil {
+		msg = fmt.Sprintf("%s: %v", msg, e.Cause)
+	}
+	return msg
+}
+
+func (e *ConnectionInactiveError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
+func (e *ConnectionInactiveError) Is(target error) bool {
+	return target == ErrConnectionInactive
 }
 
 func wrapOp(op string, err error) error {
