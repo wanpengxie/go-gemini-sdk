@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestBuildCLIArgsIncludesModelAndSandbox(t *testing.T) {
@@ -169,5 +171,44 @@ func TestFindGeminiFallsBackToNPMBin(t *testing.T) {
 	}
 	if got != candidate {
 		t.Fatalf("findGemini() = %q, want %q", got, candidate)
+	}
+}
+
+func TestRealRunnerStartDoesNotTieProcessLifetimeToContext(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("sh not available")
+	}
+
+	runner := &realRunner{}
+	ctx, cancel := context.WithCancel(context.Background())
+	handle, err := runner.Start(ctx, sh, []string{"-c", "sleep 60"}, nil, "")
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	waitCh := make(chan error, 1)
+	go func() {
+		waitCh <- handle.Wait()
+	}()
+
+	cancel()
+
+	select {
+	case err := <-waitCh:
+		t.Fatalf("Wait() returned after startup context cancel: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	if handle.KillGroup != nil {
+		_ = handle.KillGroup()
+	} else if handle.Kill != nil {
+		_ = handle.Kill()
+	}
+
+	select {
+	case <-waitCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait() did not return after kill")
 	}
 }

@@ -30,7 +30,16 @@ type processHandle struct {
 type realRunner struct{}
 
 func (r *realRunner) Start(ctx context.Context, binary string, args []string, env []string, cwd string) (*processHandle, error) {
-	cmd := exec.CommandContext(ctx, binary, args...)
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, &ProcessError{Op: "start", Err: err}
+		}
+	}
+
+	// Process lifetime is managed explicitly by Client.Close/waitProcess.
+	// Binding it to the startup handshake context would kill Gemini as soon
+	// as Connect returns and cancels its temporary startup timeout wrapper.
+	cmd := exec.Command(binary, args...)
 	cmd.SysProcAttr = newSysProcAttr()
 	if len(env) > 0 {
 		cmd.Env = env
