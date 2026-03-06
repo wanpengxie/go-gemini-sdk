@@ -152,7 +152,11 @@ func (c *Client) Connect(ctx context.Context) error {
 	return nil
 }
 
-// Send issues session/prompt request for the active session.
+// Send submits one prompt turn and blocks until ACP acknowledges the turn.
+//
+// ACP v1 `session/prompt` is a synchronous request. This call waits for prompt
+// processing to complete (including prompt-level stopReason when provided), so
+// it does not return immediately after bytes are written.
 func (c *Client) Send(ctx context.Context, prompt string) error {
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" {
@@ -213,6 +217,62 @@ func (c *Client) ReceiveWithErrors() (<-chan SessionEvent, <-chan error) {
 	return c.eventsCh, c.errsCh
 }
 
+// ReceiveTurn collects events for one turn until completion, error, or ctx cancellation.
+//
+// Do not consume Receive/ReceiveWithErrors/ReceiveBlocks/ReceiveBlocksWithErrors
+// concurrently with ReceiveTurn for the same client, otherwise events may be
+// split between consumers.
+func (c *Client) ReceiveTurn(ctx context.Context) ([]SessionEvent, error) {
+	events, errs := c.ReceiveWithErrors()
+	turnEvents := make([]SessionEvent, 0, 8)
+
+	for events != nil || errs != nil {
+		select {
+		case <-ctx.Done():
+			return turnEvents, wrapOp("client.receive_turn", ctx.Err())
+		case err, ok := <-errs:
+			if !ok {
+				errs = nil
+				continue
+			}
+			if err != nil {
+				return turnEvents, wrapOp("client.receive_turn", err)
+			}
+		case ev, ok := <-events:
+			if !ok {
+				events = nil
+				continue
+			}
+
+			turnEvents = append(turnEvents, ev)
+			if err := turnErrorFromEvent(ev); err != nil {
+				return turnEvents, wrapOp("client.receive_turn", err)
+			}
+			if isTurnCompletedEvent(ev) {
+				return turnEvents, nil
+			}
+		}
+	}
+
+	if err := c.Err(); err != nil {
+		return turnEvents, wrapOp("client.receive_turn", err)
+	}
+	return turnEvents, nil
+}
+
+// ReceiveTurnBlocks is like ReceiveTurn but returns structured StreamBlock items.
+func (c *Client) ReceiveTurnBlocks(ctx context.Context) ([]StreamBlock, error) {
+	events, err := c.ReceiveTurn(ctx)
+	blocks := make([]StreamBlock, 0, len(events))
+	for _, ev := range events {
+		blocks = append(blocks, ev.ToBlock())
+	}
+	if err != nil {
+		return blocks, err
+	}
+	return blocks, nil
+}
+
 // ReceiveBlocks returns a higher-level structured stream converted from SessionEvent.
 //
 // Do not consume Receive/ReceiveWithErrors and ReceiveBlocks/ReceiveBlocksWithErrors
@@ -253,6 +313,15 @@ func (c *Client) ReceiveMessages() <-chan StreamBlock {
 // ReceiveMessagesWithErrors is an alias of ReceiveBlocksWithErrors for cross-SDK naming alignment.
 func (c *Client) ReceiveMessagesWithErrors() (<-chan StreamBlock, <-chan error) {
 	return c.ReceiveBlocksWithErrors()
+}
+
+// SendAndReceive is a one-shot helper that sends one prompt and collects the
+// full turn as structured blocks.
+func (c *Client) SendAndReceive(ctx context.Context, prompt string) ([]StreamBlock, error) {
+	if err := c.Send(ctx, prompt); err != nil {
+		return nil, err
+	}
+	return c.ReceiveTurnBlocks(ctx)
 }
 
 // Interrupt sends session/interrupt notification to Gemini CLI.
@@ -861,6 +930,25 @@ func normalizeEventType(t string) EventType {
 		return EventTypeError
 	default:
 		return EventTypeUnknown
+	}
+}
+
+func isTurnCompletedEvent(ev SessionEvent) bool {
+	return ev.Done || ev.Type == EventTypeCompleted
+}
+
+func turnErrorFromEvent(ev SessionEvent) error {
+	if ev.Type != EventTypeError && strings.TrimSpace(ev.Error) == "" {
+		return nil
+	}
+
+	msg := strings.TrimSpace(ev.Error)
+	if msg == "" {
+		msg = "session turn failed"
+	}
+	return &ProtocolError{
+		Method:  methodSessionUpdate,
+		Message: msg,
 	}
 }
 
