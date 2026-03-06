@@ -265,6 +265,161 @@ func TestClientReceiveMessagesAlias(t *testing.T) {
 	}
 }
 
+func TestClientEmitEventBackpressure(t *testing.T) {
+	client := NewClient(WithEventBuffer(1))
+
+	client.eventsCh <- SessionEvent{
+		Type: EventTypeMessageChunk,
+		Text: "first",
+	}
+
+	blockedDone := make(chan struct{})
+	go func() {
+		defer close(blockedDone)
+		client.emitEvent(SessionEvent{
+			Type: EventTypeCompleted,
+			Done: true,
+		})
+	}()
+
+	select {
+	case <-blockedDone:
+		t.Fatal("emitEvent should block when events channel is full")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	select {
+	case ev := <-client.eventsCh:
+		if ev.Text != "first" {
+			t.Fatalf("first event text = %q, want first", ev.Text)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting first event")
+	}
+
+	select {
+	case <-blockedDone:
+	case <-time.After(time.Second):
+		t.Fatal("emitEvent did not unblock after draining events channel")
+	}
+
+	select {
+	case ev := <-client.eventsCh:
+		if ev.Type != EventTypeCompleted || !ev.Done {
+			t.Fatalf("second event = %+v, want completed done=true", ev)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting second event")
+	}
+}
+
+func TestClientReceiveBlocksWithErrorsNoDropOnBackpressure(t *testing.T) {
+	client := NewClient(WithEventBuffer(1))
+	blocks, errs := client.ReceiveBlocksWithErrors()
+
+	client.eventsCh <- SessionEvent{
+		Type: EventTypeMessageChunk,
+		Text: "first",
+	}
+	client.eventsCh <- SessionEvent{
+		Type: EventTypeCompleted,
+		Done: true,
+	}
+	close(client.eventsCh)
+
+	select {
+	case err := <-errs:
+		if err != nil {
+			t.Fatalf("unexpected receive error: %v", err)
+		}
+	case <-time.After(120 * time.Millisecond):
+	}
+
+	select {
+	case block := <-blocks:
+		if block.Kind != BlockKindText || block.Text != "first" {
+			t.Fatalf("block[0] = %+v, want text block", block)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting first block")
+	}
+
+	select {
+	case block := <-blocks:
+		if block.Kind != BlockKindDone || !block.Done {
+			t.Fatalf("block[1] = %+v, want done block", block)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting second block")
+	}
+
+	select {
+	case _, ok := <-blocks:
+		if ok {
+			t.Fatal("blocks channel still open, want closed")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting blocks channel close")
+	}
+}
+
+func TestClientSendReturnsConnectionInactiveError(t *testing.T) {
+	client := NewClient()
+	rpcConn := &conn{done: make(chan struct{})}
+	close(rpcConn.done)
+
+	client.mu.Lock()
+	client.conn = rpcConn
+	client.sessionID = "s-1"
+	client.connected = true
+	client.processErr = &ProcessError{
+		Op:         "wait",
+		ExitCode:   17,
+		StderrTail: "panic: boom",
+		Err:        errors.New("exit status 17"),
+	}
+	client.mu.Unlock()
+
+	err := client.Send(context.Background(), "hello")
+	assertConnectionInactiveError(t, err, "send", 17, "panic: boom")
+}
+
+func TestClientInterruptReturnsConnectionInactiveError(t *testing.T) {
+	client := NewClient()
+	rpcConn := &conn{done: make(chan struct{})}
+	close(rpcConn.done)
+
+	client.mu.Lock()
+	client.conn = rpcConn
+	client.sessionID = "s-1"
+	client.connected = true
+	client.processErr = &ProcessError{
+		Op:         "wait",
+		ExitCode:   9,
+		StderrTail: "killed",
+		Err:        errors.New("exit status 9"),
+	}
+	client.mu.Unlock()
+
+	err := client.Interrupt(context.Background())
+	assertConnectionInactiveError(t, err, "interrupt", 9, "killed")
+}
+
+func TestClientInterruptWhenNotConnectedReturnsError(t *testing.T) {
+	client := NewClient()
+
+	err := client.Interrupt(context.Background())
+	if err == nil {
+		t.Fatal("Interrupt() error = nil, want non-nil")
+	}
+	if !errors.Is(err, ErrConnectionInactive) {
+		t.Fatalf("Interrupt() error = %v, want ErrConnectionInactive", err)
+	}
+	if !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("Interrupt() error = %v, want io.ErrClosedPipe", err)
+	}
+}
+
 func TestClientHandlesRequestPermission(t *testing.T) {
 	got := runPermissionRoundtrip(
 		t,
@@ -407,6 +562,38 @@ func runPermissionRoundtrip(t *testing.T, permissionParams string, extraOpts ...
 		t.Fatalf("CloseContext() error = %v", err)
 	}
 	return out
+}
+
+func assertConnectionInactiveError(t *testing.T, err error, op string, exitCode int, stderrTail string) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("error = nil, want non-nil")
+	}
+	if !errors.Is(err, ErrConnectionInactive) {
+		t.Fatalf("error = %v, want ErrConnectionInactive", err)
+	}
+	if !errors.Is(err, ErrProcess) {
+		t.Fatalf("error = %v, want ErrProcess", err)
+	}
+
+	var inactiveErr *ConnectionInactiveError
+	if !errors.As(err, &inactiveErr) {
+		t.Fatalf("error type = %T, want ConnectionInactiveError", err)
+	}
+	if inactiveErr.Op != op {
+		t.Fatalf("inactiveErr.Op = %q, want %q", inactiveErr.Op, op)
+	}
+
+	var processErr *ProcessError
+	if !errors.As(err, &processErr) {
+		t.Fatalf("error = %v, want ProcessError in unwrap chain", err)
+	}
+	if processErr.ExitCode != exitCode {
+		t.Fatalf("processErr.ExitCode = %d, want %d", processErr.ExitCode, exitCode)
+	}
+	if processErr.StderrTail != stderrTail {
+		t.Fatalf("processErr.StderrTail = %q, want %q", processErr.StderrTail, stderrTail)
+	}
 }
 
 func waitTurnEvents(t *testing.T, events <-chan SessionEvent, errs <-chan error, timeout time.Duration) []SessionEvent {

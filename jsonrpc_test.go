@@ -3,6 +3,8 @@ package gemini
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -77,6 +79,60 @@ func TestConnNotificationDispatch(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timeout waiting notification")
+	}
+}
+
+func TestConnDispatchNotificationBackpressure(t *testing.T) {
+	rpcConn := &conn{
+		notifyCh: make(chan jsonrpcMessage, 1),
+		errCh:    make(chan error, 1),
+		done:     make(chan struct{}),
+	}
+
+	first := jsonrpcMessage{Method: "first"}
+	second := jsonrpcMessage{Method: "second"}
+	rpcConn.notifyCh <- first
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		rpcConn.dispatchNotification(second)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("dispatchNotification should block when notify channel is full")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	select {
+	case msg := <-rpcConn.notifyCh:
+		if msg.Method != "first" {
+			t.Fatalf("first notification method = %q, want first", msg.Method)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting first notification")
+	}
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("dispatchNotification did not unblock after draining notify channel")
+	}
+
+	select {
+	case msg := <-rpcConn.notifyCh:
+		if msg.Method != "second" {
+			t.Fatalf("second notification method = %q, want second", msg.Method)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting second notification")
+	}
+
+	select {
+	case err := <-rpcConn.errCh:
+		t.Fatalf("unexpected error pushed: %v", err)
+	default:
 	}
 }
 
@@ -166,6 +222,9 @@ func TestConnCloseUnblocksPendingCall(t *testing.T) {
 	case err := <-errCh:
 		if err == nil {
 			t.Fatal("call() error = nil, want non-nil")
+		}
+		if !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("call() error = %v, want io.ErrClosedPipe", err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timeout waiting pending call to unblock")
