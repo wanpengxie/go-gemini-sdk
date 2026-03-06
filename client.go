@@ -29,8 +29,9 @@ type Client struct {
 	closing   bool
 	closed    bool
 
-	processDone chan struct{}
-	processErr  error
+	processDone   chan struct{}
+	processErr    error
+	launchCleanup func()
 
 	eventsCh chan SessionEvent
 	errsCh   chan error
@@ -76,12 +77,22 @@ func (c *Client) Connect(ctx context.Context) error {
 	startupCtx, startupCancel := withTimeoutIfNeeded(ctx, c.opts.startupTimeout)
 	defer startupCancel()
 
-	binary, err := findGemini(startupCtx, c.opts.binaryPath)
+	preparedOpts, launchCleanup, err := prepareLaunchOptions(c.opts)
+	if err != nil {
+		return wrapOp("client.connect", err)
+	}
+	defer func() {
+		if launchCleanup != nil {
+			launchCleanup()
+		}
+	}()
+
+	binary, err := findGemini(startupCtx, preparedOpts.binaryPath)
 	if err != nil {
 		return wrapOp("client.connect", err)
 	}
 
-	handle, err := c.runner.Start(startupCtx, binary, buildCLIArgs(c.opts), mergeEnv(c.opts.env), c.opts.workDir)
+	handle, err := c.runner.Start(startupCtx, binary, buildCLIArgs(preparedOpts), mergeEnv(preparedOpts.env), preparedOpts.workDir)
 	if err != nil {
 		return wrapOp("client.connect", err)
 	}
@@ -123,7 +134,9 @@ func (c *Client) Connect(ctx context.Context) error {
 	c.closing = false
 	c.processErr = nil
 	c.processDone = make(chan struct{})
+	c.launchCleanup = launchCleanup
 	c.mu.Unlock()
+	launchCleanup = nil
 
 	c.pumpWG.Add(3)
 	go c.pumpNotifications(rpcConn)
@@ -622,6 +635,8 @@ func (c *Client) waitProcess() {
 	if rpcConn != nil {
 		rpcConn.close()
 	}
+
+	c.cleanupLaunchArtifacts()
 }
 
 func (c *Client) closeOutputsWhenStopped() {
@@ -725,6 +740,17 @@ func (c *Client) cleanupFailedConnect(handle *processHandle, rpcConn *conn, stde
 	}
 	if stderrDone != nil {
 		<-stderrDone
+	}
+}
+
+func (c *Client) cleanupLaunchArtifacts() {
+	c.mu.Lock()
+	cleanup := c.launchCleanup
+	c.launchCleanup = nil
+	c.mu.Unlock()
+
+	if cleanup != nil {
+		cleanup()
 	}
 }
 

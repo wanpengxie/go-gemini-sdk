@@ -99,7 +99,10 @@ func WithModel(model string) Option {
 	}
 }
 
-// WithSandbox sets sandbox mode placeholder for future tickets.
+// WithSandbox enables Gemini CLI sandbox mode.
+//
+// Current Gemini CLI only supports a boolean --sandbox switch. Any non-empty
+// mode string is treated as "enable sandbox" for forward compatibility.
 func WithSandbox(mode string) Option {
 	return func(o *options) {
 		o.sandbox = mode

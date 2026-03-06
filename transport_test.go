@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -14,7 +15,7 @@ func TestBuildCLIArgsIncludesModelAndSandbox(t *testing.T) {
 	o.sandbox = "workspace-write"
 
 	args := buildCLIArgs(o)
-	want := []string{"--experimental-acp", "--model", "gemini-2.5-pro", "--sandbox", "workspace-write"}
+	want := []string{"--experimental-acp", "--model", "gemini-2.5-pro", "--sandbox"}
 	if len(args) != len(want) {
 		t.Fatalf("args len = %d, want %d", len(args), len(want))
 	}
@@ -29,7 +30,6 @@ func TestBuildCLIArgsIncludesPolicyFlags(t *testing.T) {
 	o := defaultOptions()
 	o.approvalMode = "auto"
 	o.allowedTools = []string{"bash", "read"}
-	o.excludedTools = []string{"edit"}
 	o.addDirs = []string{"/repo", "/tmp"}
 	o.policyPaths = []string{"/etc/gemini-cli/policies", "/workspace/.gemini/policies"}
 
@@ -38,7 +38,6 @@ func TestBuildCLIArgsIncludesPolicyFlags(t *testing.T) {
 		"--experimental-acp",
 		"--approval-mode", "auto",
 		"--allowed-tools", "bash,read",
-		"--excluded-tools", "edit",
 		"--include-directories", "/repo,/tmp",
 		"--policy", "/etc/gemini-cli/policies",
 		"--policy", "/workspace/.gemini/policies",
@@ -50,6 +49,43 @@ func TestBuildCLIArgsIncludesPolicyFlags(t *testing.T) {
 		if args[i] != want[i] {
 			t.Fatalf("args[%d] = %q, want %q", i, args[i], want[i])
 		}
+	}
+}
+
+func TestPrepareLaunchOptionsConvertsExcludedToolsToPolicy(t *testing.T) {
+	o := defaultOptions()
+	o.excludedTools = []string{"run_shell_command", " write_file ", "run_shell_command", ""}
+	o.policyPaths = []string{"/tmp/original-policy.toml"}
+
+	prepared, cleanup, err := prepareLaunchOptions(o)
+	if err != nil {
+		t.Fatalf("prepareLaunchOptions() error = %v", err)
+	}
+	defer cleanup()
+
+	if len(prepared.excludedTools) != 0 {
+		t.Fatalf("prepared.excludedTools = %v, want empty", prepared.excludedTools)
+	}
+	if len(prepared.policyPaths) != 2 {
+		t.Fatalf("prepared.policyPaths len = %d, want 2", len(prepared.policyPaths))
+	}
+	if prepared.policyPaths[0] != "/tmp/original-policy.toml" {
+		t.Fatalf("prepared.policyPaths[0] = %q, want original policy path", prepared.policyPaths[0])
+	}
+
+	content, err := os.ReadFile(prepared.policyPaths[1])
+	if err != nil {
+		t.Fatalf("read generated policy: %v", err)
+	}
+	text := string(content)
+	if !strings.Contains(text, `toolName = "run_shell_command"`) {
+		t.Fatalf("generated policy missing run_shell_command rule:\n%s", text)
+	}
+	if !strings.Contains(text, `toolName = "write_file"`) {
+		t.Fatalf("generated policy missing write_file rule:\n%s", text)
+	}
+	if strings.Contains(text, `toolName = ""`) {
+		t.Fatalf("generated policy unexpectedly contains empty tool rule:\n%s", text)
 	}
 }
 
